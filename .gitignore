@@ -1,0 +1,7 @@
+# Private signing keys must NEVER be committed — this repository is public and
+# the key is a fleet-wide credential. Only agent.ed25519.pub belongs here.
+*.key
+*.pem
+!agent.ed25519.pub
+
+.DS_Store

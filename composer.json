@@ -1,0 +1,9 @@
+{
+    "name": "lanangary-jb/juicebox-site-health",
+    "description": "JB Site Health — read-only site-health endpoint feeding the Juicebox Digital Support Plan report (must-use plugin).",
+    "type": "wordpress-muplugin",
+    "license": "proprietary",
+    "require": {
+        "composer/installers": "^1.0 || ^2.0"
+    }
+}

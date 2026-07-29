@@ -1,0 +1,3 @@
+# Keep the Composer package to what a client site actually needs.
+/.gitattributes  export-ignore
+/.gitignore      export-ignore
