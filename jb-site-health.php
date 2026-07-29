@@ -2,7 +2,7 @@
 /**
  * Plugin Name: JB Site Health
  * Description: Read-only site-health endpoint for the Juicebox Digital Support Plan report. Returns the data points that cannot be observed from outside the site — WordPress/PHP version, plugin update status, hardening flags, and brute-force counts.
- * Version:     1.0.0
+ * Version:     1.1.0
  * Author:      Juicebox Creative
  * License:     Proprietary — internal Juicebox use only
  *
@@ -65,16 +65,31 @@ if ( defined( 'JB_HEALTH_VERSION' ) ) {
 }
 
 /**
- * Fleet signing public key. A public key can VERIFY a token but never FORGE
- * one, so shipping it to every site is safe — the private half lives only in
- * the jb-dashboard repo. Deliberately NOT the jb-ops key: separate credential,
- * separate blast radius.
+ * Fleet signing public keys. A public key can VERIFY a token but never FORGE
+ * one, so shipping them to every site is safe — the private half lives only in
+ * the private skills repo, next to the caller that signs with it. Deliberately
+ * NOT the jb-ops key: separate credential, separate blast radius.
+ *
+ * This is a LIST, not a single key, and that is the point: rotation would
+ * otherwise mean swapping the key on ~40 sites in the same instant or locking
+ * ourselves out. Instead, add the incoming key here and deploy the fleet at
+ * whatever pace suits; both keys verify meanwhile. Once every site is carrying
+ * it, switch the caller over and drop the retired key on the next routine
+ * deploy. Newest first — the common case then matches on the first pass.
+ *
+ * Defining JB_HEALTH_SIGNING_PUBKEYS in wp-config.php overrides the list
+ * entirely, which is how a one-off site opts out of the fleet credential.
  */
-if ( ! defined( 'JB_HEALTH_SIGNING_PUBKEY' ) ) {
-	define( 'JB_HEALTH_SIGNING_PUBKEY', 'Fi1wC+cqjykT90wK2sR/VJUQcj7nC+kDS6wd007/xFo=' );
+if ( ! defined( 'JB_HEALTH_SIGNING_PUBKEYS' ) ) {
+	define(
+		'JB_HEALTH_SIGNING_PUBKEYS',
+		array(
+			'Fi1wC+cqjykT90wK2sR/VJUQcj7nC+kDS6wd007/xFo=',
+		)
+	);
 }
 define( 'JB_HEALTH_SIGN_CONTEXT', 'jb-health-v1:' );
-define( 'JB_HEALTH_VERSION', '1.0.0' );
+define( 'JB_HEALTH_VERSION', '1.1.0' );
 define( 'JB_HEALTH_SCHEMA', 1 );
 
 /**
@@ -147,10 +162,10 @@ final class JB_Site_Health {
 	/**
 	 * Verify a fleet-signed token: jb1.<UTCdate:Ymd>.<base64url Ed25519 signature>.
 	 *
-	 * The signature must cover JB_HEALTH_SIGN_CONTEXT.<date> under the embedded
-	 * public key, and the date must sit within +/-1 day of the server's UTC date
-	 * (grace for clock skew). Daily rotation falls out of that window: a captured
-	 * token stops verifying on its own after roughly a day.
+	 * The signature must cover JB_HEALTH_SIGN_CONTEXT.<date> under ANY of the
+	 * embedded public keys, and the date must sit within +/-1 day of the server's
+	 * UTC date (grace for clock skew). Daily rotation falls out of that window: a
+	 * captured token stops verifying on its own after roughly a day.
 	 *
 	 * Returns false rather than throwing, so anything malformed just 401s.
 	 *
@@ -158,11 +173,7 @@ final class JB_Site_Health {
 	 * @return bool
 	 */
 	private static function verify_signed_token( $token ) {
-		$pub_b64 = ( defined( 'JB_HEALTH_SIGNING_PUBKEY' ) && JB_HEALTH_SIGNING_PUBKEY )
-			? (string) JB_HEALTH_SIGNING_PUBKEY
-			: '';
-
-		if ( '' === $pub_b64 || ! function_exists( 'sodium_crypto_sign_verify_detached' ) ) {
+		if ( ! function_exists( 'sodium_crypto_sign_verify_detached' ) ) {
 			return false;
 		}
 		if ( ! preg_match( '/^jb1\.([0-9]{8})\.([A-Za-z0-9_-]+)$/', (string) $token, $m ) ) {
@@ -171,14 +182,12 @@ final class JB_Site_Health {
 
 		$date = $m[1];
 		$sig  = self::b64url_decode( $m[2] );
-		$pk   = base64_decode( $pub_b64, true );
 
-		if ( false === $sig || false === $pk
-			|| SODIUM_CRYPTO_SIGN_BYTES !== strlen( $sig )
-			|| SODIUM_CRYPTO_SIGN_PUBLICKEYBYTES !== strlen( $pk ) ) {
+		if ( false === $sig || SODIUM_CRYPTO_SIGN_BYTES !== strlen( $sig ) ) {
 			return false;
 		}
 
+		// Check the cheap, key-independent condition before touching any crypto.
 		$allowed = array(
 			gmdate( 'Ymd', time() - DAY_IN_SECONDS ),
 			gmdate( 'Ymd' ),
@@ -188,7 +197,44 @@ final class JB_Site_Health {
 			return false;
 		}
 
-		return sodium_crypto_sign_verify_detached( $sig, JB_HEALTH_SIGN_CONTEXT . $date, $pk );
+		$message = JB_HEALTH_SIGN_CONTEXT . $date;
+
+		// Accept a signature from any key currently in the list — that overlap is
+		// what lets a rotation roll across the fleet gradually instead of all at
+		// once. Deliberately no early return on a bad key: one malformed entry
+		// must not shadow a good one further down.
+		foreach ( self::signing_pubkeys() as $pub_b64 ) {
+			$pk = base64_decode( (string) $pub_b64, true );
+			if ( false === $pk || SODIUM_CRYPTO_SIGN_PUBLICKEYBYTES !== strlen( $pk ) ) {
+				continue;
+			}
+			if ( sodium_crypto_sign_verify_detached( $sig, $message, $pk ) ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * The accepted fleet public keys, as a list of base64 strings.
+	 *
+	 * Tolerates a bare string so a site still carrying the pre-1.1 constant — or
+	 * a wp-config.php override written against it — keeps working rather than
+	 * silently 401ing every request.
+	 *
+	 * @return string[]
+	 */
+	private static function signing_pubkeys() {
+		$keys = array();
+
+		if ( defined( 'JB_HEALTH_SIGNING_PUBKEYS' ) ) {
+			$keys = (array) JB_HEALTH_SIGNING_PUBKEYS;
+		} elseif ( defined( 'JB_HEALTH_SIGNING_PUBKEY' ) ) {
+			$keys = array( JB_HEALTH_SIGNING_PUBKEY );
+		}
+
+		return array_filter( array_map( 'strval', $keys ) );
 	}
 
 	/** URL-safe base64 decode (accepts -_ and missing padding). False on garbage. */

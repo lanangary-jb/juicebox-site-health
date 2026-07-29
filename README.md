@@ -95,11 +95,12 @@ so it activates itself with no stub and no admin step. Same pattern as `lanangar
 
 ## Use
 
-The token minter is **not** in this repository. It lives beside the private key in the private
-`jb-dashboard` repo, so it needs no configuration:
+The token minter is **not** in this repository — it is the caller, in the private
+`digital-support-plan` skill, which carries the private half of the keypair and signs a fresh
+token on every run. Nothing needs configuring at either end. To mint one by hand for debugging:
 
 ```bash
-TOKEN=$(php jb-site-health/sign.php)
+TOKEN=$(python3 scripts/digital_support_plan.py --mint-token)
 curl -H "Authorization: Bearer $TOKEN" https://<site>/wp-json/jb-health/v1/report
 ```
 
@@ -118,14 +119,28 @@ Same proven scheme as the jb-ops bridge, with its own key and its own signing co
 jb1.<UTCdate Ymd>.<base64url Ed25519 signature of "jb-health-v1:<date>">
 ```
 
-The plugin embeds only the **public** key, which can verify a token but never forge one. The date
-must be within ±1 day UTC, so a captured token expires on its own after roughly a day. Anything
-malformed, expired, or unsigned gets an identical `401 Unauthorised` — the response never reveals
-which.
+The plugin embeds only the **public** keys, which can verify a token but never forge one. That is
+what makes this repository safe to keep public: everything in it is already readable by anyone, and
+none of it can be turned into a valid request. The date must be within ±1 day UTC, so a captured
+token expires on its own after roughly a day. Anything malformed, expired, or unsigned gets an
+identical `401 Unauthorised` — the response never reveals which.
 
-`agent.ed25519.key` is the fleet credential and is **not in this repository** — it lives in the
-private `jb-dashboard` repo, next to `sign.php`, which is why minting a token needs no configuration.
-To rotate: regenerate the pair, replace `JB_HEALTH_SIGNING_PUBKEY` in the plugin, redeploy.
+The private half is the fleet credential and is **not in this repository**. It exists in exactly one
+place: the private skills repo, inside the caller that signs with it. There is no second copy, no
+vault, and nothing to keep in sync.
+
+### Rotating
+
+`JB_HEALTH_SIGNING_PUBKEYS` is a **list**, and every key in it is accepted. Without that, rotation
+would mean changing the key on ~40 sites in the same instant. Instead:
+
+1. Generate a new pair.
+2. Add the new public key to the list here. Both keys now verify — deploy the fleet at whatever pace suits.
+3. Once every site carries it, switch the caller to the new private key.
+4. Drop the retired public key on the next routine deploy.
+
+No coordinated cutover, no window where a site is unreachable. A site can also override the list
+in `wp-config.php` to opt out of the fleet credential entirely.
 
 ## The one rule: never guess
 
