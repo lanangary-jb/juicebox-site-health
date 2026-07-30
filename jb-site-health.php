@@ -66,9 +66,9 @@ if ( defined( 'JB_HEALTH_VERSION' ) ) {
 
 /**
  * Fleet signing public keys. A public key can VERIFY a token but never FORGE
- * one, so shipping them to every site is safe — the private half is held only by
- * the caller, in its runtime environment, and is never committed anywhere.
- * Deliberately NOT the jb-ops key: separate credential, separate blast radius.
+ * one, so shipping them to every site is safe — the private half lives only in
+ * the private skills repo, next to the caller that signs with it. Deliberately
+ * NOT the jb-ops key: separate credential, separate blast radius.
  *
  * This is a LIST, not a single key, and that is the point: rotation would
  * otherwise mean swapping the key on ~40 sites in the same instant or locking

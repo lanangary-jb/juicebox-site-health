@@ -97,9 +97,8 @@ so it activates itself with no stub and no admin step. Same pattern as `lanangar
 ## Use
 
 The token minter is **not** in this repository — it is the caller, in the private
-`digital-support-plan` skill, which reads the private half from `JB_HEALTH_KEY` in its own
-environment and signs a fresh token on every run. Nothing needs configuring on the site side. To
-mint one by hand for debugging:
+`digital-support-plan` skill, which carries the private half of the keypair and signs a fresh
+token on every run. Nothing needs configuring at either end. To mint one by hand for debugging:
 
 ```bash
 TOKEN=$(python3 scripts/digital_support_plan.py --mint-token)
@@ -127,11 +126,16 @@ none of it can be turned into a valid request. The date must be within ±1 day U
 token expires on its own after roughly a day. Anything malformed, expired, or unsigned gets an
 identical `401 Unauthorised` — the response never reveals which.
 
-The private half is the fleet credential and is **not in this repository**. It is not committed
-anywhere: it lives in the caller's runtime environment as `JB_HEALTH_KEY`, read at signing time.
-It was briefly a constant in the skill's source, which was a mistake — a committed credential is in
-git history permanently, and readable by everyone with access to the repo — so it was moved out and
-the key rotated. See [Rotating](#rotating).
+The private half is the fleet credential and is **not in this repository**. It exists in exactly one
+place: the private skills repo, inside the caller that signs with it. There is no second copy, no
+vault, and nothing to keep in sync.
+
+That is a deliberate trade rather than an oversight. A committed credential is in git history
+permanently and is readable by everyone with access to that repo — accepted because the alternative
+(a secret somebody has to set per environment) is exactly the configuration step that left this
+report showing `Unknown` on almost every site, and because this plugin is read-only, so the worst
+case is disclosure rather than takeover. **Rotating is the revocation** — deleting the constant is
+not. See [Rotating](#rotating).
 
 ### Rotating
 
@@ -146,11 +150,12 @@ would mean changing the key on ~40 sites in the same instant. Instead:
 No coordinated cutover, no window where a site is unreachable. A site can also override the list
 in `wp-config.php` to opt out of the fleet credential entirely.
 
-**Rotated 30 Jul 2026 in `1.2.0`**, retiring the key that had been committed to the skill's source.
-The fleet was a single staging site at the time, so this went straight to the new key rather than
-running the staged path above. The retired public key is gone from the list, so the old private key —
-which remains in the skills repo's git history and cannot be removed from it — now verifies against
-nothing. Any site still on `1.1.0` will reject current tokens until it redeploys.
+**Rotated 30 Jul 2026 in `1.2.0`** after a review flagged the key in the caller's source. The team
+chose to keep it in source — see [Auth](#auth) — so the rotation stands on its own: the fleet was a
+single staging site at the time, so this went straight to the new key rather than running the staged
+path above. The retired public key is gone from the list, so the old private key — which remains in
+the skills repo's git history and cannot be removed from it — now verifies against nothing. Any site
+still on `1.1.0` will reject current tokens until it redeploys.
 
 ## The one rule: never guess
 
