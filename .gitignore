@@ -1,7 +1,11 @@
 # Private signing keys must NEVER be committed — this repository is public and
-# the key is a fleet-wide credential. Only agent.ed25519.pub belongs here.
+# the key is a fleet-wide credential.
+#
+# Public keys are not kept as loose files here either. They live in the
+# JB_HEALTH_SIGNING_PUBKEYS array in jb-site-health.php, which is the single
+# source of truth for what this plugin will accept. A second copy on disk only
+# drifts, and then it is not obvious which one is actually in force.
 *.key
 *.pem
-!agent.ed25519.pub
 
 .DS_Store

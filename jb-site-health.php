@@ -2,7 +2,7 @@
 /**
  * Plugin Name: JB Site Health
  * Description: Read-only site-health endpoint for the Juicebox Digital Support Plan report. Returns the data points that cannot be observed from outside the site — WordPress/PHP version, plugin update status, hardening flags, and brute-force counts.
- * Version:     1.1.0
+ * Version:     1.2.0
  * Author:      Juicebox Creative
  * License:     Proprietary — internal Juicebox use only
  *
@@ -66,9 +66,9 @@ if ( defined( 'JB_HEALTH_VERSION' ) ) {
 
 /**
  * Fleet signing public keys. A public key can VERIFY a token but never FORGE
- * one, so shipping them to every site is safe — the private half lives only in
- * the private skills repo, next to the caller that signs with it. Deliberately
- * NOT the jb-ops key: separate credential, separate blast radius.
+ * one, so shipping them to every site is safe — the private half is held only by
+ * the caller, in its runtime environment, and is never committed anywhere.
+ * Deliberately NOT the jb-ops key: separate credential, separate blast radius.
  *
  * This is a LIST, not a single key, and that is the point: rotation would
  * otherwise mean swapping the key on ~40 sites in the same instant or locking
@@ -84,12 +84,12 @@ if ( ! defined( 'JB_HEALTH_SIGNING_PUBKEYS' ) ) {
 	define(
 		'JB_HEALTH_SIGNING_PUBKEYS',
 		array(
-			'Fi1wC+cqjykT90wK2sR/VJUQcj7nC+kDS6wd007/xFo=',
+			'1bqkgVQVjVQmovyhqMrS7qqKk8A7NKf3ablhA4icVtA=',
 		)
 	);
 }
 define( 'JB_HEALTH_SIGN_CONTEXT', 'jb-health-v1:' );
-define( 'JB_HEALTH_VERSION', '1.1.0' );
+define( 'JB_HEALTH_VERSION', '1.2.0' );
 define( 'JB_HEALTH_SCHEMA', 1 );
 
 /**

@@ -3,8 +3,9 @@
 A **read-only** WordPress endpoint that supplies the six Digital Support Plan data points which
 cannot be observed from outside a site. One request, one signed token, no per-site configuration.
 
-> **This repository is public.** The fleet private key (`agent.ed25519.key`) is deliberately **not**
-> committed here and is gitignored. Only the public key ships with the plugin. See [Auth](#auth).
+> **This repository is public.** The fleet private key is deliberately **not** committed here, and
+> is not committed anywhere else either — it lives only in the caller's environment. Only the public
+> keys ship with the plugin, and a public key cannot forge a token. See [Auth](#auth).
 
 ## Why this exists
 
@@ -96,8 +97,9 @@ so it activates itself with no stub and no admin step. Same pattern as `lanangar
 ## Use
 
 The token minter is **not** in this repository — it is the caller, in the private
-`digital-support-plan` skill, which carries the private half of the keypair and signs a fresh
-token on every run. Nothing needs configuring at either end. To mint one by hand for debugging:
+`digital-support-plan` skill, which reads the private half from `JB_HEALTH_KEY` in its own
+environment and signs a fresh token on every run. Nothing needs configuring on the site side. To
+mint one by hand for debugging:
 
 ```bash
 TOKEN=$(python3 scripts/digital_support_plan.py --mint-token)
@@ -125,9 +127,11 @@ none of it can be turned into a valid request. The date must be within ±1 day U
 token expires on its own after roughly a day. Anything malformed, expired, or unsigned gets an
 identical `401 Unauthorised` — the response never reveals which.
 
-The private half is the fleet credential and is **not in this repository**. It exists in exactly one
-place: the private skills repo, inside the caller that signs with it. There is no second copy, no
-vault, and nothing to keep in sync.
+The private half is the fleet credential and is **not in this repository**. It is not committed
+anywhere: it lives in the caller's runtime environment as `JB_HEALTH_KEY`, read at signing time.
+It was briefly a constant in the skill's source, which was a mistake — a committed credential is in
+git history permanently, and readable by everyone with access to the repo — so it was moved out and
+the key rotated. See [Rotating](#rotating).
 
 ### Rotating
 
@@ -141,6 +145,12 @@ would mean changing the key on ~40 sites in the same instant. Instead:
 
 No coordinated cutover, no window where a site is unreachable. A site can also override the list
 in `wp-config.php` to opt out of the fleet credential entirely.
+
+**Rotated 30 Jul 2026 in `1.2.0`**, retiring the key that had been committed to the skill's source.
+The fleet was a single staging site at the time, so this went straight to the new key rather than
+running the staged path above. The retired public key is gone from the list, so the old private key —
+which remains in the skills repo's git history and cannot be removed from it — now verifies against
+nothing. Any site still on `1.1.0` will reject current tokens until it redeploys.
 
 ## The one rule: never guess
 
@@ -160,7 +170,7 @@ never `0`, which would read as "no attacks" rather than "not measured".
 
 ```jsonc
 {
-  "ok": true, "schema_version": 1, "plugin_version": "1.0.0",
+  "ok": true, "schema_version": 1, "plugin_version": "1.2.0",
   "generated_at": "2026-07-28T03:33:49+00:00",
   "site":      { "siteurl": "…", "home": "…", "is_multisite": false, "server_software": "nginx/1.25.4" },
   "wordpress": { "version": "6.9.4", "latest": "7.0.2", "update_available": true, "checked_at": 1785121264 },
