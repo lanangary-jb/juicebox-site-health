@@ -2,7 +2,7 @@
 /**
  * Plugin Name: JB Site Health
  * Description: Read-only site-health endpoint for the Juicebox Digital Support Plan report. Returns the data points that cannot be observed from outside the site — WordPress/PHP version, plugin update status, hardening flags, and brute-force counts.
- * Version:     1.2.0
+ * Version:     1.3.0
  * Author:      Juicebox Creative
  * License:     Proprietary — internal Juicebox use only
  *
@@ -89,7 +89,7 @@ if ( ! defined( 'JB_HEALTH_SIGNING_PUBKEYS' ) ) {
 	);
 }
 define( 'JB_HEALTH_SIGN_CONTEXT', 'jb-health-v1:' );
-define( 'JB_HEALTH_VERSION', '1.2.0' );
+define( 'JB_HEALTH_VERSION', '1.3.0' );
 define( 'JB_HEALTH_SCHEMA', 1 );
 
 /**
@@ -607,17 +607,38 @@ final class JB_Site_Health {
 	/**
 	 * Is PHP execution blocked inside the uploads directory?
 	 *
-	 * Only .htaccess / .user.ini are inspectable from PHP. On nginx or LiteSpeed
-	 * with an nginx-style config the rule may live in a server config this code
-	 * cannot read — so report `null` (unknown) with the server software named,
-	 * rather than claiming "not blocked" and turning a config we simply cannot
-	 * see into a client-facing FAIL.
+	 * This answers `true` or `null` — never `false`. Reading files can PROVE a
+	 * rule exists; it can never prove one does not, because the rule may equally
+	 * live in an Apache/LiteSpeed vhost block, an nginx server block, a WAF, or
+	 * a php-fpm pool config — none of which PHP can read. The previous version
+	 * returned `false` whenever it found no file rule on a non-nginx server,
+	 * which reported sites hardened at the document root (a very common shape)
+	 * as "Not blocked" in a client-facing report.
+	 *
+	 * Two places are inspected, both of which PHP genuinely can read:
+	 *
+	 *   1. uploads/.htaccess and uploads/.user.ini — a rule scoped to this
+	 *      directory, so any deny-ish directive counts.
+	 *   2. every .htaccess from the uploads directory up to the document root —
+	 *      here a rule must name BOTH the uploads path and a PHP-ish extension
+	 *      before it counts, so an unrelated deny elsewhere in the file cannot
+	 *      be mistaken for uploads hardening.
+	 *
+	 * When neither finds anything the answer is `null` with a reason naming what
+	 * was inspected. The authoritative negative is an HTTP request for a .php
+	 * under uploads, which the report's caller performs — it tests behaviour
+	 * rather than inferring it, and it works on sites without this plugin.
+	 *
+	 * Paths in the output are relative to the document root, never absolute:
+	 * they reach a client-facing report, and absolute server paths are exactly
+	 * what the report pipeline strips as connector infrastructure.
 	 */
 	private static function uploads_php_execution() {
 		$out = array(
-			'blocked'  => null,
-			'evidence' => null,
-			'reason'   => null,
+			'blocked'   => null,
+			'evidence'  => null,
+			'reason'    => null,
+			'inspected' => array(),
 		);
 
 		$uploads = wp_upload_dir();
@@ -626,38 +647,171 @@ final class JB_Site_Health {
 			return $out;
 		}
 
-		$base     = $uploads['basedir'];
-		$htaccess = trailingslashit( $base ) . '.htaccess';
-		$userini  = trailingslashit( $base ) . '.user.ini';
+		$base = self::real_dir( $uploads['basedir'] );
+		if ( ! $base ) {
+			$out['reason'] = 'uploads directory not resolvable on disk';
+			return $out;
+		}
 
-		if ( file_exists( $htaccess ) && is_readable( $htaccess ) ) {
-			$contents = (string) file_get_contents( $htaccess ); // phpcs:ignore WordPress.WP.AlternativeFunctions
+		$root = self::document_root();
+
+		// 1. Rules scoped to the uploads directory itself.
+		$htaccess = $base . '/.htaccess';
+		$userini  = $base . '/.user.ini';
+
+		if ( is_readable( $htaccess ) ) {
+			$out['inspected'][] = self::relative_to( $htaccess, $root );
+			$contents           = (string) file_get_contents( $htaccess ); // phpcs:ignore WordPress.WP.AlternativeFunctions
 			if ( preg_match( '/(deny|forbidden|SetHandler|php_flag|RemoveHandler|<Files)/i', $contents ) ) {
 				$out['blocked']  = true;
-				$out['evidence'] = 'uploads/.htaccess contains a PHP-deny rule';
+				$out['evidence'] = self::relative_to( $htaccess, $root ) . ' contains a PHP-deny rule';
 				return $out;
 			}
 		}
 		if ( file_exists( $userini ) ) {
-			$out['blocked']  = true;
-			$out['evidence'] = 'uploads/.user.ini present';
+			$out['inspected'][] = self::relative_to( $userini, $root );
+			$out['blocked']     = true;
+			$out['evidence']    = self::relative_to( $userini, $root ) . ' present';
 			return $out;
+		}
+
+		// 2. Ancestor .htaccess files, up to and including the document root.
+		//    A rule only counts here if it names the uploads path AND a
+		//    server-side script extension — anything looser would read an
+		//    unrelated deny block as uploads hardening.
+		$rel = trim( self::relative_to( $base, $root ), '/' );
+		if ( '' !== $rel ) {
+			foreach ( self::ancestor_htaccess( $base, $root ) as $file ) {
+				$out['inspected'][] = self::relative_to( $file, $root );
+				$contents           = (string) file_get_contents( $file ); // phpcs:ignore WordPress.WP.AlternativeFunctions
+				if ( self::denies_php_under( $contents, $rel ) ) {
+					$out['blocked']  = true;
+					$out['evidence'] = self::relative_to( $file, $root )
+						. ' denies PHP under ' . $rel;
+					return $out;
+				}
+			}
 		}
 
 		$server = isset( $_SERVER['SERVER_SOFTWARE'] )
 			? sanitize_text_field( wp_unslash( $_SERVER['SERVER_SOFTWARE'] ) )
 			: '';
 
-		if ( $server && preg_match( '/nginx/i', $server ) ) {
-			$out['reason'] = 'no .htaccess/.user.ini rule found, and this server (' . $server
-				. ') is configured outside the webroot — cannot be determined from PHP';
-			return $out;
-		}
-
-		$out['blocked']  = false;
-		$out['evidence'] = 'no PHP-deny rule found in the uploads directory'
-			. ( $server ? ' (server: ' . $server . ')' : '' );
+		$out['reason'] = 'no rule found in '
+			. ( $out['inspected'] ? implode( ', ', $out['inspected'] ) : 'any readable .htaccess/.user.ini' )
+			. ( $server ? ' (server: ' . $server . ')' : '' )
+			. ' — a rule in a vhost, nginx server block or WAF is not readable from PHP,'
+			. ' so absence of a file rule does not mean execution is allowed';
 		return $out;
+	}
+
+	/**
+	 * Does this .htaccess deny PHP under the given uploads-relative path?
+	 *
+	 * Line-oriented on purpose, and all three conditions must hold on the SAME
+	 * line, because an .htaccess is a pile of unrelated directives and matching
+	 * across them invents rules nobody wrote:
+	 *
+	 *   - it names the uploads path, so a deny aimed at wp-config.php or at
+	 *     another directory is not read as uploads hardening;
+	 *   - it names a server-side script extension;
+	 *   - it actually denies — [F], Require ... denied, SetHandler, php_flag,
+	 *     RemoveHandler, 403. A RewriteRule that merely rewrites is not a block.
+	 *
+	 * Comments are skipped: a line describing the intent is not the rule. The
+	 * extension test deliberately does not require the dot to sit next to the
+	 * extension — the real-world form is
+	 * `RewriteRule ^app/uploads/.*\.(?:php|phtml|…)$ - [F,L,NC]`, where what
+	 * follows the dot is `(?:`, not `php`.
+	 *
+	 * @param string $contents Raw .htaccess text.
+	 * @param string $rel      Uploads dir relative to the document root, e.g. "app/uploads".
+	 * @return bool
+	 */
+	private static function denies_php_under( $contents, $rel ) {
+		$path_re = '/' . preg_quote( $rel, '/' ) . '/i';
+		$ext_re  = '/(?:^|[^a-z0-9])(?:php[0-9]?|phtml|pht|phps|phar)(?:$|[^a-z0-9])/i';
+		$deny_re = '/(?:\[[^\]]*\bF\b[^\]]*\]|deny|denied|forbidden|SetHandler|RemoveHandler|php_flag|\b403\b)/i';
+
+		foreach ( preg_split( '/\r\n|\r|\n/', (string) $contents ) as $line ) {
+			$trimmed = ltrim( $line );
+			if ( '' === $trimmed || '#' === $trimmed[0] ) {
+				continue;
+			}
+			if ( preg_match( $path_re, $line )
+				&& preg_match( $ext_re, $line )
+				&& preg_match( $deny_re, $line ) ) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/** realpath() for a directory, or '' when it does not resolve. */
+	private static function real_dir( $path ) {
+		$real = realpath( (string) $path );
+		return ( $real && is_dir( $real ) ) ? rtrim( $real, '/' ) : '';
+	}
+
+	/**
+	 * The document root, resolved.
+	 *
+	 * DOCUMENT_ROOT is the honest answer when the SAPI supplies one. Falling
+	 * back to ABSPATH's parent covers Bedrock, where WordPress lives one level
+	 * below the web root in www/wp.
+	 */
+	private static function document_root() {
+		$root = isset( $_SERVER['DOCUMENT_ROOT'] )
+			? self::real_dir( sanitize_text_field( wp_unslash( $_SERVER['DOCUMENT_ROOT'] ) ) )
+			: '';
+		if ( $root ) {
+			return $root;
+		}
+		return self::real_dir( dirname( rtrim( ABSPATH, '/' ) ) );
+	}
+
+	/**
+	 * Readable .htaccess files between $from (exclusive) and $root (inclusive).
+	 *
+	 * Walks upward, nearest first, so the most specific rule wins. Bounded at
+	 * eight levels and stopped at the document root so a misconfigured root can
+	 * never send this climbing to /.
+	 *
+	 * @return string[]
+	 */
+	private static function ancestor_htaccess( $from, $root ) {
+		$found = array();
+		$dir   = $from;
+		for ( $i = 0; $i < 8; $i++ ) {
+			$parent = dirname( $dir );
+			if ( $parent === $dir || '' === $parent || '/' === $parent ) {
+				break;
+			}
+			$file = $parent . '/.htaccess';
+			if ( is_readable( $file ) ) {
+				$found[] = $file;
+			}
+			if ( $root && $parent === $root ) {
+				break;
+			}
+			$dir = $parent;
+		}
+		return $found;
+	}
+
+	/**
+	 * A path expressed relative to the document root.
+	 *
+	 * Absolute server paths are connector infrastructure — the report pipeline
+	 * strips them, and they mean nothing to a client. When the path is not under
+	 * the root, only the basename survives.
+	 */
+	private static function relative_to( $path, $root ) {
+		$path = (string) $path;
+		if ( $root && 0 === strpos( $path, $root . '/' ) ) {
+			return substr( $path, strlen( $root ) + 1 );
+		}
+		return basename( $path );
 	}
 
 	/**

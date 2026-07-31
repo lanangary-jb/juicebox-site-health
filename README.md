@@ -163,10 +163,25 @@ The report is client-facing, so a wrong value is worse than an honest "don't kno
 that cannot be determined returns `null` alongside a `reason`. Nothing infers or falls back to a
 plausible default.
 
-The clearest case is `uploads_php_execution`. Only `.htaccess` and `.user.ini` are inspectable from
-PHP. On nginx the rule usually lives in a server config this code cannot read — so it returns
-`null` plus the server name, rather than reporting "not blocked" and turning a config we simply
-cannot see into a client-facing FAIL.
+The clearest case is `uploads_php_execution`, which answers `true` or `null` and **never `false`**.
+Reading files can prove a rule exists; it can never prove one does not, because the rule may equally
+live in an Apache/LiteSpeed vhost block, an nginx server block, a WAF or a php-fpm pool — none of
+which PHP can read.
+
+Two readable places are inspected. A rule in `uploads/.htaccess` or `uploads/.user.ini` is scoped to
+that directory, so any deny-ish directive counts. Every `.htaccess` from there up to the document
+root is also read, but a rule there must name the uploads path **and** a script extension **and**
+actually deny (`[F]`, `Require … denied`, `SetHandler`, `php_flag`, `RemoveHandler`, `403`) on the
+same line — comments are skipped, because an intent described is not an intent enforced. The
+`inspected` array reports exactly which files were read, relative to the document root.
+
+Ancestor `.htaccess` matching landed in 1.3.0. Before it, a site hardened at the document root — the
+common Juicebox shape, e.g. `RewriteRule ^app/uploads/.*\.(?:php|…)$ - [F,L,NC]` — was reported as
+`false`/"Not blocked" in client-facing reports while being fully protected.
+
+The authoritative negative is an HTTP request for a `.php` under uploads, which the support-plan
+skill performs. That tests behaviour rather than inferring it, and it works on sites without this
+plugin — so a genuinely open site is still caught, by the check that can actually prove it.
 
 Likewise `brute_force` returns `null` with a reason when no supported security plugin is present —
 never `0`, which would read as "no attacks" rather than "not measured".
@@ -175,7 +190,7 @@ never `0`, which would read as "no attacks" rather than "not measured".
 
 ```jsonc
 {
-  "ok": true, "schema_version": 1, "plugin_version": "1.2.0",
+  "ok": true, "schema_version": 1, "plugin_version": "1.3.0",
   "generated_at": "2026-07-28T03:33:49+00:00",
   "site":      { "siteurl": "…", "home": "…", "is_multisite": false, "server_software": "nginx/1.25.4" },
   "wordpress": { "version": "6.9.4", "latest": "7.0.2", "update_available": true, "checked_at": 1785121264 },
@@ -185,7 +200,11 @@ never `0`, which would read as "no attacks" rather than "not measured".
                                 "current": "2.9.24", "new": "2.10.5" } ] },
   "themes":    { "update_count": 0, "updates": [] },
   "hardening": { "disallow_file_edit": { "defined": true, "value": true },
-                 "uploads_php_execution": { "blocked": null, "reason": "…" },
+                 // `blocked` is true or null, never false. `evidence` accompanies true,
+                 // `reason` accompanies null; `inspected` lists the files actually read,
+                 // relative to the document root.
+                 "uploads_php_execution": { "blocked": true, "evidence": ".htaccess denies PHP under app/uploads",
+                                            "reason": null, "inspected": [".htaccess"] },
                  "blog_public": true, "debug_display": false },
   "brute_force": { "source": "solid-security", "window_days": 30,
                    "lockouts": 0, "failed_logins": 0 }
