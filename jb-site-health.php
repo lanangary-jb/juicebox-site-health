@@ -2,7 +2,7 @@
 /**
  * Plugin Name: JB Site Health
  * Description: Read-only site-health endpoint for the Juicebox Digital Support Plan report. Returns the data points that cannot be observed from outside the site — WordPress/PHP version, plugin update status, hardening flags, and brute-force counts.
- * Version:     1.3.0
+ * Version:     1.4.0
  * Author:      Juicebox Creative
  * License:     Proprietary — internal Juicebox use only
  *
@@ -89,7 +89,7 @@ if ( ! defined( 'JB_HEALTH_SIGNING_PUBKEYS' ) ) {
 	);
 }
 define( 'JB_HEALTH_SIGN_CONTEXT', 'jb-health-v1:' );
-define( 'JB_HEALTH_VERSION', '1.3.0' );
+define( 'JB_HEALTH_VERSION', '1.4.0' );
 define( 'JB_HEALTH_SCHEMA', 1 );
 
 /**
@@ -272,6 +272,7 @@ final class JB_Site_Health {
 			'themes'         => self::theme_info( $refresh ),
 			'hardening'      => self::hardening_info(),
 			'brute_force'    => self::brute_force_info(),
+			'forms'          => self::forms_info(),
 		);
 
 		$response = new WP_REST_Response( $payload, 200 );
@@ -872,6 +873,299 @@ final class JB_Site_Health {
 		}
 
 		$out['reason'] = 'no supported security plugin detected (Solid Security or Wordfence required)';
+		return $out;
+	}
+
+	// ----------------------------------------------------------------- //
+	// Forms
+	// ----------------------------------------------------------------- //
+
+	/**
+	 * Form health, read-only.
+	 *
+	 * Forms are the thing that breaks quietly after a WordPress, PHP or plugin
+	 * update: the page still renders, the visitor still sees "thanks", and the
+	 * first we hear of it is a client asking why nobody called them back. None
+	 * of that is visible from outside the site.
+	 *
+	 * Everything here is observation, never a verdict. This function does not
+	 * submit anything, does not send mail, and does not decide whether a form is
+	 * "broken" — it reports the configuration and the entry volume, and lets the
+	 * caller compare across months. Two signals do most of the work:
+	 *
+	 *   - `notifications[].active` false, or a `to` pointing somewhere stale,
+	 *     is a delivery failure that has already happened.
+	 *   - `entries_30d` collapsing against `entries_prev_30d` on a form that
+	 *     used to receive steady traffic is the fingerprint of a form that
+	 *     started failing silently.
+	 *
+	 * Gravity Forms only for now — it is what the fleet runs. Any other form
+	 * plugin returns a reason rather than a misleading empty list.
+	 *
+	 * @return array
+	 */
+	private static function forms_info() {
+		$out = array(
+			'engine'                => null,
+			'engine_version'        => null,
+			'recaptcha_v3_sitewide' => null,
+			'mailer'                => self::mailer_info(),
+			'count'                 => null,
+			'items'                 => null,
+			'reason'                => null,
+		);
+
+		if ( ! class_exists( 'GFAPI' ) || ! class_exists( 'GFCommon' ) ) {
+			$out['reason'] = 'Gravity Forms is not active on this site; no other form plugin is supported yet';
+			return $out;
+		}
+
+		$out['engine']         = 'gravityforms';
+		$out['engine_version'] = property_exists( 'GFCommon', 'version' ) ? GFCommon::$version : null;
+
+		// The reCAPTCHA add-on can enable v3 site-wide. That loads the script on
+		// every page but only gates forms that carry a captcha field, so the two
+		// facts are reported separately rather than conflated.
+		$recaptcha = get_option( 'gravityformsaddon_gravityformsrecaptcha_settings' );
+		if ( is_array( $recaptcha ) ) {
+			$out['recaptcha_v3_sitewide'] = ! empty( $recaptcha['recaptcha_keys_status_v3'] );
+		}
+
+		$forms = GFAPI::get_forms( null, false );
+		if ( ! is_array( $forms ) ) {
+			$out['reason'] = 'Gravity Forms returned no form list';
+			return $out;
+		}
+
+		$stats = self::entry_stats();
+		$items = array();
+
+		foreach ( $forms as $form ) {
+			$id = isset( $form['id'] ) ? (int) $form['id'] : 0;
+			$s  = isset( $stats[ $id ] ) ? $stats[ $id ] : null;
+
+			$items[] = array(
+				'id'                => $id,
+				'title'             => isset( $form['title'] ) ? $form['title'] : null,
+				'active'            => isset( $form['is_active'] ) ? (bool) $form['is_active'] : null,
+				'captcha'           => self::form_captcha( $form, $out['recaptcha_v3_sitewide'] ),
+				'notifications'     => self::form_notifications( $form ),
+				'entries_total'     => $s ? (int) $s['total'] : 0,
+				'entries_30d'       => $s ? (int) $s['last30'] : 0,
+				'entries_prev_30d'  => $s ? (int) $s['prev30'] : 0,
+				'last_entry'        => $s && $s['last_entry'] ? gmdate( 'c', strtotime( $s['last_entry'] . ' UTC' ) ) : null,
+			);
+		}
+
+		$out['count'] = count( $items );
+		$out['items'] = $items;
+
+		if ( null === $stats ) {
+			$out['reason'] = 'entry counts unavailable: the Gravity Forms entry table was not readable';
+		}
+
+		return $out;
+	}
+
+	/**
+	 * What captcha protection applies to this form.
+	 *
+	 * There are two independent gates and they look nothing alike, so they are
+	 * reported separately rather than collapsed into one boolean:
+	 *
+	 *   `field`        — a visible captcha FIELD placed on the form in the editor.
+	 *   `recaptcha_v3` — the invisible reCAPTCHA v3 the add-on applies to every
+	 *                    form once site keys are configured.
+	 *
+	 * The v3 setting is stored INVERTED, which is easy to get backwards: a form
+	 * carries `gravityformsrecaptcha.disable-recaptchav3` only when someone has
+	 * opted it OUT. No key means v3 is active. So v3 applies when site keys are
+	 * configured AND the form has no opt-out — which is why an otherwise
+	 * identical-looking form can be gated while its neighbour is not.
+	 *
+	 * Either gate makes the form impossible to exercise with an unattended
+	 * submission, so the caller needs both to tell "tested and fine" apart from
+	 * "never tested".
+	 *
+	 * @param array     $form      Gravity Forms form object.
+	 * @param bool|null $v3_active Whether v3 site keys are configured at all.
+	 * @return array
+	 */
+	private static function form_captcha( $form, $v3_active ) {
+		$out = array(
+			'field'        => false,
+			'field_type'   => null,
+			'recaptcha_v3' => null,
+		);
+
+		if ( null !== $v3_active ) {
+			$opted_out = ! empty( $form['gravityformsrecaptcha']['disable-recaptchav3'] );
+			$out['recaptcha_v3'] = $v3_active && ! $opted_out;
+		}
+
+		if ( empty( $form['fields'] ) || ! is_array( $form['fields'] ) ) {
+			return $out;
+		}
+		foreach ( $form['fields'] as $field ) {
+			$type = is_object( $field ) && isset( $field->type ) ? $field->type : null;
+			if ( 'captcha' !== $type ) {
+				continue;
+			}
+			$out['field'] = true;
+			// captchaType: recaptcha / simple_captcha / math, absent means reCAPTCHA.
+			$out['field_type'] = isset( $field->captchaType ) && $field->captchaType ? $field->captchaType : 'recaptcha';
+			return $out;
+		}
+		return $out;
+	}
+
+	/**
+	 * Where each notification is configured to go, and whether it is switched on.
+	 *
+	 * `to` is reported verbatim, merge tags and all ({admin_email}, or a field
+	 * id when the form routes to an address the visitor typed). Resolving it
+	 * would mean guessing, and a wrong address in a client-facing report is
+	 * worse than an unresolved one.
+	 *
+	 * @param array $form Gravity Forms form object.
+	 * @return array
+	 */
+	private static function form_notifications( $form ) {
+		if ( empty( $form['notifications'] ) || ! is_array( $form['notifications'] ) ) {
+			return array();
+		}
+
+		$out = array();
+		foreach ( $form['notifications'] as $n ) {
+			if ( ! is_array( $n ) ) {
+				continue;
+			}
+			$out[] = array(
+				'name'    => isset( $n['name'] ) ? $n['name'] : null,
+				// GF omits isActive entirely on notifications that have never been
+				// toggled, and those are active. Absent must not read as "off".
+				'active'  => ! isset( $n['isActive'] ) || (bool) $n['isActive'],
+				'event'   => isset( $n['event'] ) ? $n['event'] : null,
+				'to_type' => isset( $n['toType'] ) ? $n['toType'] : null,
+				'to'      => isset( $n['to'] ) ? $n['to'] : null,
+			);
+		}
+		return $out;
+	}
+
+	/**
+	 * Entry volume for every form, in one grouped query.
+	 *
+	 * Per-form queries would mean three round trips each, which on a site with
+	 * forty forms turns a health check into a slow page. Trashed and spam rows
+	 * are excluded so a spam wave cannot mask a form that stopped receiving
+	 * genuine submissions.
+	 *
+	 * @return array|null Keyed by form id, or null if the table is unreadable.
+	 */
+	private static function entry_stats() {
+		global $wpdb;
+
+		$table = $wpdb->prefix . 'gf_entry';
+		if ( ! self::table_exists( $table ) ) {
+			return null;
+		}
+
+		$now    = time();
+		$d30    = gmdate( 'Y-m-d H:i:s', $now - ( 30 * DAY_IN_SECONDS ) );
+		$d60    = gmdate( 'Y-m-d H:i:s', $now - ( 60 * DAY_IN_SECONDS ) );
+
+		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- table name cannot be bound.
+		$rows = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT form_id,
+				        COUNT(*) AS total,
+				        SUM(date_created >= %s) AS last30,
+				        SUM(date_created >= %s AND date_created < %s) AS prev30,
+				        MAX(date_created) AS last_entry
+				 FROM `{$table}`
+				 WHERE status = 'active'
+				 GROUP BY form_id",
+				$d30,
+				$d60,
+				$d30
+			),
+			ARRAY_A
+		);
+		// phpcs:enable
+
+		if ( ! is_array( $rows ) ) {
+			return null;
+		}
+
+		$out = array();
+		foreach ( $rows as $r ) {
+			$out[ (int) $r['form_id'] ] = $r;
+		}
+		return $out;
+	}
+
+	/**
+	 * How this site actually sends mail.
+	 *
+	 * A deactivated SMTP plugin is one of the quietest ways for every form on a
+	 * site to stop delivering while still looking perfectly healthy, so the
+	 * active flag matters more than the presence of the plugin.
+	 *
+	 * WP_ENV is reported alongside it because the Bedrock template ships a
+	 * mu-plugin that deactivates SMTP plugins outside production by design —
+	 * without that context, `active: false` on a staging box reads as a fault
+	 * when it is the intended behaviour.
+	 *
+	 * @return array
+	 */
+	private static function mailer_info() {
+		$out = array(
+			'plugin' => null,
+			'active' => null,
+			'mailer' => null,
+			'wp_env' => defined( 'WP_ENV' ) ? WP_ENV : null,
+			'reason' => null,
+		);
+
+		// Slug => the plugin file WordPress knows it by.
+		$known = array(
+			'wp-mail-smtp'    => 'wp-mail-smtp/wp_mail_smtp.php',
+			'post-smtp'       => 'post-smtp/postman-smtp.php',
+			'easy-wp-smtp'    => 'easy-wp-smtp/easy-wp-smtp.php',
+			'fluent-smtp'     => 'fluent-smtp/fluent-smtp.php',
+			'wp-ses'          => 'wp-ses/wp-ses.php',
+			'sendgrid'        => 'sendgrid-email-delivery-simplified/wpsendgrid.php',
+		);
+
+		if ( ! function_exists( 'is_plugin_active' ) ) {
+			require_once ABSPATH . 'wp-admin/includes/plugin.php';
+		}
+		$installed = array_keys( get_plugins() );
+
+		foreach ( $known as $slug => $file ) {
+			if ( ! in_array( $file, $installed, true ) ) {
+				continue;
+			}
+			$out['plugin'] = $slug;
+			$out['active'] = is_plugin_active( $file );
+
+			if ( 'wp-mail-smtp' === $slug ) {
+				$settings = get_option( 'wp_mail_smtp' );
+				if ( is_array( $settings ) && isset( $settings['mail']['mailer'] ) ) {
+					$out['mailer'] = $settings['mail']['mailer'];
+				}
+			}
+
+			if ( ! $out['active'] && $out['wp_env'] && 'production' !== $out['wp_env'] ) {
+				$out['reason'] = 'installed but inactive; this site is not production, where the Bedrock template deactivates SMTP plugins by design';
+			} elseif ( ! $out['active'] ) {
+				$out['reason'] = 'installed but NOT active on a production site — mail is falling back to PHP mail()';
+			}
+			return $out;
+		}
+
+		$out['reason'] = 'no recognised SMTP plugin installed; mail goes through PHP mail() or a host-level relay';
 		return $out;
 	}
 

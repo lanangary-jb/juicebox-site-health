@@ -190,7 +190,7 @@ never `0`, which would read as "no attacks" rather than "not measured".
 
 ```jsonc
 {
-  "ok": true, "schema_version": 1, "plugin_version": "1.3.0",
+  "ok": true, "schema_version": 1, "plugin_version": "1.4.0",
   "generated_at": "2026-07-28T03:33:49+00:00",
   "site":      { "siteurl": "…", "home": "…", "is_multisite": false, "server_software": "nginx/1.25.4" },
   "wordpress": { "version": "6.9.4", "latest": "7.0.2", "update_available": true, "checked_at": 1785121264 },
@@ -207,9 +207,61 @@ never `0`, which would read as "no attacks" rather than "not measured".
                                             "reason": null, "inspected": [".htaccess"] },
                  "blog_public": true, "debug_display": false },
   "brute_force": { "source": "solid-security", "window_days": 30,
-                   "lockouts": 0, "failed_logins": 0 }
+                   "lockouts": 0, "failed_logins": 0 },
+  "forms":     { "engine": "gravityforms", "engine_version": "2.10.0",
+                 "recaptcha_v3_sitewide": true,
+                 "mailer": { "plugin": "wp-mail-smtp", "active": true, "mailer": "sendgrid",
+                             "wp_env": "production", "reason": null },
+                 "count": 4,
+                 "items": [ { "id": 1, "title": "Contact Form", "active": true,
+                              // two independent gates, never collapsed into one flag
+                              "captcha": { "field": false, "field_type": null, "recaptcha_v3": false },
+                              "notifications": [ { "name": "Admin Notification", "active": true,
+                                                   "event": "form_submission", "to_type": "email",
+                                                   "to": "hello@example.com" } ],
+                              "entries_total": 60, "entries_30d": 4, "entries_prev_30d": 3,
+                              "last_entry": "2026-08-31T01:34:44+00:00" } ] }
 }
 ```
+
+## Forms (added 1.4.0)
+
+Forms are the thing that breaks quietly after a WordPress, PHP or plugin update: the page still
+renders, the visitor still sees "thanks", and the first we hear of it is a client asking why nobody
+called them back. None of that is visible from outside the site, which makes it exactly this
+plugin's job.
+
+**This section observes; it does not judge.** Nothing here submits a form, sends mail, or decides
+that a form is "broken" — it reports configuration and entry volume and lets the caller compare
+across months. Two signals carry most of the value:
+
+| Signal | What it means |
+|---|---|
+| `notifications[].active` false, or a stale `to` | A delivery failure that has **already happened** |
+| `entries_30d` collapsed against `entries_prev_30d` | The fingerprint of a form that started failing silently |
+| `mailer.active` false on a production site | Every form on the site is falling back to PHP `mail()` |
+
+Three traps this encodes, all of which produce a confidently wrong answer if you get them backwards:
+
+- **The v3 setting is inverted.** A form carries `gravityformsrecaptcha.disable-recaptchav3` only
+  when someone opted it *out*. No key means v3 is **active**. So `recaptcha_v3` is true when site
+  keys are configured *and* the form has no opt-out — which is how two otherwise identical forms end
+  up with one gated and one not.
+- **A missing `isActive` on a notification means active**, not off. Gravity Forms omits the key
+  entirely until someone toggles it.
+- **`to` is reported verbatim**, merge tags and all (`{admin_email}`, or a field id when the form
+  routes to an address the visitor typed). Resolving it would mean guessing.
+
+`entries_*` counts exclude trashed and spam rows, so a spam wave cannot mask a form that stopped
+receiving genuine submissions. All forms are counted in a single grouped query rather than three per
+form, so a site with forty forms does not turn the health check into a slow page.
+
+`wp_env` sits beside `mailer.active` deliberately: the Bedrock template ships a mu-plugin that
+deactivates SMTP plugins outside production **by design**, so `active: false` on a staging box is
+correct behaviour rather than a fault. Without that context the field reads as a false alarm.
+
+Gravity Forms only for now — it is what the fleet runs. Any other form plugin returns a `reason`
+rather than a misleading empty list.
 
 Compare `site.home` against the domain you asked about before trusting the numbers — that is what
 stops a staging box quietly answering for production. The support-plan skill's SSH connector does
