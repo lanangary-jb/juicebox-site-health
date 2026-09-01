@@ -2,7 +2,7 @@
 /**
  * Plugin Name: JB Site Health
  * Description: Read-only site-health endpoint for the Juicebox Digital Support Plan report. Returns the data points that cannot be observed from outside the site — WordPress/PHP version, plugin update status, hardening flags, and brute-force counts.
- * Version:     1.4.0
+ * Version:     1.5.0
  * Author:      Juicebox Creative
  * License:     Proprietary — internal Juicebox use only
  *
@@ -89,7 +89,7 @@ if ( ! defined( 'JB_HEALTH_SIGNING_PUBKEYS' ) ) {
 	);
 }
 define( 'JB_HEALTH_SIGN_CONTEXT', 'jb-health-v1:' );
-define( 'JB_HEALTH_VERSION', '1.4.0' );
+define( 'JB_HEALTH_VERSION', '1.5.0' );
 define( 'JB_HEALTH_SCHEMA', 1 );
 
 /**
@@ -97,12 +97,13 @@ define( 'JB_HEALTH_SCHEMA', 1 );
  */
 final class JB_Site_Health {
 
-	/** Wire up the REST route. */
+	/** Wire up the REST routes, and the 401-before-400 guard they depend on. */
 	public static function init() {
 		add_action( 'rest_api_init', array( __CLASS__, 'register_routes' ) );
+		add_filter( 'rest_request_before_callbacks', array( __CLASS__, 'shield_unauthorised' ), 10, 3 );
 	}
 
-	/** Register GET /wp-json/jb-health/v1/report. */
+	/** Register GET /wp-json/jb-health/v1/report and /wp-json/jb-health/v1/forms/entry. */
 	public static function register_routes() {
 		register_rest_route(
 			'jb-health/v1',
@@ -117,6 +118,46 @@ final class JB_Site_Health {
 					'refresh' => array(
 						'default'           => false,
 						'sanitize_callback' => 'rest_sanitize_boolean',
+					),
+				),
+			)
+		);
+
+		/**
+		 * Entry lookup — did ONE known submission land, and what did Gravity
+		 * Forms record about its notifications?
+		 *
+		 * Same permission callback as /report. Arguments are declared here
+		 * rather than checked in the callback so WordPress rejects a malformed
+		 * request before any of our code runs: a bad arg comes back as its own
+		 * `rest_invalid_param` (400) carrying our code and message in
+		 * `data.details`. See shield_unauthorised() for why an unauthenticated
+		 * caller still gets a 401 out of that path.
+		 */
+		register_rest_route(
+			'jb-health/v1',
+			'/forms/entry',
+			array(
+				'methods'             => 'GET',
+				'callback'            => array( __CLASS__, 'handle_entry_lookup' ),
+				'permission_callback' => array( __CLASS__, 'authorise' ),
+				'args'                => array(
+					'form'  => array(
+						'required'          => true,
+						'validate_callback' => array( __CLASS__, 'validate_form_id' ),
+						'sanitize_callback' => 'absint',
+					),
+					'stamp' => array(
+						'required'          => true,
+						'validate_callback' => array( __CLASS__, 'validate_stamp' ),
+						'sanitize_callback' => 'sanitize_text_field',
+					),
+					// A week is already generous for "did the submission I just
+					// made land"; the window is what bounds the LIKE scan.
+					'hours' => array(
+						'default'           => 24,
+						'validate_callback' => array( __CLASS__, 'validate_hours' ),
+						'sanitize_callback' => 'absint',
 					),
 				),
 			)
@@ -157,6 +198,46 @@ final class JB_Site_Health {
 		// Same generic message either way — never reveal whether the token was
 		// malformed, expired, or simply wrong.
 		return new WP_Error( 'jb_health_unauthorised', 'Unauthorised.', array( 'status' => 401 ) );
+	}
+
+	/**
+	 * Put 401 back in front of 400.
+	 *
+	 * WordPress does NOT check permission first. WP_REST_Server::dispatch()
+	 * runs has_valid_params() and sanitize_params() itself and hands the
+	 * resulting WP_Error to respond_to_request(), which then skips the
+	 * permission_callback entirely because a response already exists. The
+	 * observable effect on an authenticated route is that a stranger sending a
+	 * malformed argument gets a descriptive 400 while the same stranger sending
+	 * a well-formed one gets 401 — and the difference between those two answers
+	 * is a free oracle for the argument format, handed out before any
+	 * credential is ever examined.
+	 *
+	 * On /report that never mattered: its only argument cannot fail. The entry
+	 * lookup takes a stamp whose format is the thing protecting it, so the
+	 * oracle is worth closing.
+	 *
+	 * This runs on every REST request on the site, so it returns on the first
+	 * line for the normal case (no error yet) and only acts on handlers whose
+	 * permission callback is ours — it never touches another plugin's route,
+	 * and an authorised caller still gets the descriptive 400 it needs.
+	 *
+	 * @param mixed           $response Response or error so far — null when nothing has failed.
+	 * @param array           $handler  Route handler matched for the request.
+	 * @param WP_REST_Request $request  The request.
+	 * @return mixed
+	 */
+	public static function shield_unauthorised( $response, $handler, $request ) {
+		if ( ! is_wp_error( $response ) ) {
+			return $response;
+		}
+		if ( empty( $handler['permission_callback'] ) || array( __CLASS__, 'authorise' ) !== $handler['permission_callback'] ) {
+			return $response;
+		}
+
+		$permission = self::authorise( $request );
+
+		return is_wp_error( $permission ) ? $permission : $response;
 	}
 
 	/**
@@ -1169,11 +1250,346 @@ final class JB_Site_Health {
 		return $out;
 	}
 
+	// ----------------------------------------------------------------- //
+	// Entry lookup
+	// ----------------------------------------------------------------- //
+
+	/**
+	 * Answer one question, and only one: did the submission carrying THIS run
+	 * reference land, and what did Gravity Forms record about its notifications?
+	 *
+	 * form-check submits a form from outside the server and then has to prove
+	 * two things the browser cannot show it — that the entry was actually
+	 * stored, and that WordPress actually handed the notification to a mail
+	 * server. On a local site it reads the database directly. On staging, live
+	 * or a Loop runner it has neither database nor WP-CLI, so it asks here.
+	 *
+	 * The answer is 200 whether or not the entry exists: "no entry carrying
+	 * that stamp" is a legitimate result of the check rather than a transport
+	 * failure, and squashing it into a 404 would make it indistinguishable
+	 * from this route being absent on a site still running 1.4.0.
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return WP_REST_Response
+	 */
+	public static function handle_entry_lookup( $request ) {
+		$form  = (int) $request->get_param( 'form' );
+		$stamp = (string) $request->get_param( 'stamp' );
+		$hours = (int) $request->get_param( 'hours' );
+
+		$payload = array(
+			'ok'             => true,
+			'schema_version' => JB_HEALTH_SCHEMA,
+			'plugin_version' => JB_HEALTH_VERSION,
+			'generated_at'   => gmdate( 'c' ),
+			'site'           => self::site_info(),
+			// Echoed back so a queued or retried call can never be read against
+			// the wrong question.
+			'query'          => array(
+				'form'  => $form,
+				'stamp' => $stamp,
+				'hours' => $hours,
+			),
+		);
+
+		$response = new WP_REST_Response( array_merge( $payload, self::entry_lookup( $form, $stamp, $hours ) ), 200 );
+		// Per-site operational data, exactly like /report — never let a proxy
+		// or CDN hold it.
+		$response->header( 'Cache-Control', 'no-store, private' );
+		return $response;
+	}
+
+	/**
+	 * A form id, as an id — not "12abc", which absint() would quietly accept as 12.
+	 *
+	 * @param mixed $value Raw query value.
+	 * @return true|WP_Error
+	 */
+	public static function validate_form_id( $value ) {
+		if ( is_scalar( $value ) && preg_match( '/^[0-9]+$/D', (string) $value ) && (int) $value >= 1 ) {
+			return true;
+		}
+		return new WP_Error( 'jb_health_bad_form', 'form must be a positive integer.', array( 'status' => 400 ) );
+	}
+
+	/**
+	 * The stamp format IS the security model of this route.
+	 *
+	 * form-check writes a run reference — JBFC-<8 hex>, suffixed -F<form id>
+	 * for the per-form variant — into a name/text/textarea field before it
+	 * submits, and that reference is the only thing this endpoint will ever
+	 * match on. Accepting an arbitrary needle would turn a read-only reporting
+	 * key into "search every entry on this site for string X", which is a PII
+	 * exfiltration tool wearing a health-check badge. A caller can only ask
+	 * about a reference it wrote itself.
+	 *
+	 * The D modifier is not decoration: without it PHP's `$` also matches
+	 * before a trailing newline, so "JBFC-DEADBEEF\n" would pass a pattern
+	 * that reads as though it could not.
+	 *
+	 * @param mixed $value Raw query value.
+	 * @return true|WP_Error
+	 */
+	public static function validate_stamp( $value ) {
+		if ( is_string( $value ) && preg_match( '/^JBFC-[A-F0-9]{8}(?:-F[0-9]{1,6})?$/D', $value ) ) {
+			return true;
+		}
+		return new WP_Error(
+			'jb_health_bad_stamp',
+			'stamp must be a form-check run reference: JBFC-XXXXXXXX, or JBFC-XXXXXXXX-F<form id>.',
+			array( 'status' => 400 )
+		);
+	}
+
+	/**
+	 * The window is a bound, not a preference. `meta_value` carries no index a
+	 * leading-wildcard LIKE can use, so an unbounded scan across an entry meta
+	 * table with years of rows in it is a denial of service dressed as a query
+	 * string. One week is already generous for "did the submission I just made
+	 * land".
+	 *
+	 * @param mixed $value Raw query value.
+	 * @return true|WP_Error
+	 */
+	public static function validate_hours( $value ) {
+		if ( is_scalar( $value ) && preg_match( '/^[0-9]+$/D', (string) $value ) ) {
+			$hours = (int) $value;
+			if ( $hours >= 1 && $hours <= 168 ) {
+				return true;
+			}
+		}
+		return new WP_Error( 'jb_health_bad_hours', 'hours must be an integer between 1 and 168.', array( 'status' => 400 ) );
+	}
+
+	/**
+	 * Find the entry carrying $stamp, then read what Gravity Forms recorded
+	 * about the notifications it tried to send for it.
+	 *
+	 * Two deliberate choices:
+	 *
+	 *   - No `status` filter. A test submission that landed in spam or trash is
+	 *     a FINDING — the form works, but the entry is being thrown away — so
+	 *     the status is reported rather than used to hide the row.
+	 *     `entry_stats()` filters to active because it is counting genuine
+	 *     volume; this is looking for one specific row we know we created.
+	 *   - The date window narrows before the LIKE does, which is what keeps
+	 *     this cheap on a site with years of entries.
+	 *
+	 * Nothing the visitor typed is ever returned: only ids, the entry status,
+	 * timestamps, and the meta_key of the field the stamp was found in.
+	 *
+	 * @param int    $form_id Gravity Forms form id.
+	 * @param string $stamp   Validated form-check run reference.
+	 * @param int    $hours   How far back to look.
+	 * @return array
+	 */
+	private static function entry_lookup( $form_id, $stamp, $hours ) {
+		global $wpdb;
+
+		$out = array(
+			'engine'        => null,
+			'found'         => false,
+			'entry'         => null,
+			'notifications' => self::no_notification_notes( null ),
+			'reason'        => null,
+		);
+
+		if ( ! class_exists( 'GFAPI' ) || ! class_exists( 'GFCommon' ) ) {
+			$out['reason']                  = 'Gravity Forms is not active on this site; no other form plugin is supported yet';
+			$out['notifications']['reason'] = $out['reason'];
+			return $out;
+		}
+
+		$entries = $wpdb->prefix . 'gf_entry';
+		$meta    = $wpdb->prefix . 'gf_entry_meta';
+		if ( ! self::table_exists( $entries ) || ! self::table_exists( $meta ) ) {
+			$out['reason']                  = 'the Gravity Forms entry tables were not readable';
+			$out['notifications']['reason'] = $out['reason'];
+			return $out;
+		}
+
+		$out['engine'] = 'gravityforms';
+
+		// Gravity Forms stores date_created in UTC, so the bound is built in UTC too.
+		$since = gmdate( 'Y-m-d H:i:s', time() - ( $hours * HOUR_IN_SECONDS ) );
+		$like  = '%' . $wpdb->esc_like( $stamp ) . '%';
+
+		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- table names cannot be bound.
+		$row = $wpdb->get_row(
+			$wpdb->prepare(
+				"SELECT e.id, e.form_id, e.status, e.date_created, m.meta_key
+				 FROM `{$entries}` e
+				 JOIN `{$meta}` m ON m.entry_id = e.id
+				 WHERE e.form_id = %d
+				   AND e.date_created >= %s
+				   AND m.meta_value LIKE %s
+				 ORDER BY e.id DESC
+				 LIMIT 1",
+				$form_id,
+				$since,
+				$like
+			),
+			ARRAY_A
+		);
+		// phpcs:enable
+
+		if ( ! $row ) {
+			$out['reason']                  = sprintf(
+				'no entry carrying that stamp on form %d in the last %dh',
+				$form_id,
+				$hours
+			);
+			$out['notifications']['reason'] = $out['reason'];
+			return $out;
+		}
+
+		$out['found'] = true;
+		$out['entry'] = array(
+			'id'            => (int) $row['id'],
+			'form_id'       => (int) $row['form_id'],
+			'status'        => isset( $row['status'] ) ? (string) $row['status'] : null,
+			'created_at'    => empty( $row['date_created'] ) ? null : gmdate( 'c', strtotime( $row['date_created'] . ' UTC' ) ),
+			// The FIELD the stamp was found in, never its contents.
+			'matched_field' => isset( $row['meta_key'] ) ? (string) $row['meta_key'] : null,
+		);
+		$out['notifications'] = self::notification_notes( (int) $row['id'] );
+
+		return $out;
+	}
+
+	/**
+	 * What Gravity Forms recorded about each notification for one entry.
+	 *
+	 * GF writes one note per attempt from
+	 * GFFormsModel::add_notification_note() — present since GF 2.4.14 — with
+	 * note_type 'notification' and sub_type 'success' or 'error'. The success
+	 * text is GF's own "WordPress successfully passed the notification email to
+	 * the sending server"; the error text carries the underlying reason (an
+	 * invalid TO address, or whatever PHPMailer's ErrorInfo said).
+	 *
+	 * That wording is also the honest limit of the check: it proves the mail
+	 * was ACCEPTED by the sending server, never that it reached an inbox. It is
+	 * still the difference between "the form quietly mails nobody" and "the
+	 * mail left the building".
+	 *
+	 * The note text is GF's own system message rather than visitor input, so
+	 * returning it discloses nothing about the submitter — it is capped at 500
+	 * characters because an SMTP error can carry an entire server transcript.
+	 *
+	 * @param int $entry_id Entry to read notes for.
+	 * @return array
+	 */
+	private static function notification_notes( $entry_id ) {
+		global $wpdb;
+
+		$out   = self::no_notification_notes( null );
+		$table = $wpdb->prefix . 'gf_entry_notes';
+
+		if ( ! self::table_exists( $table ) ) {
+			$out['reason'] = 'the Gravity Forms entry notes table is not present on this site';
+			return $out;
+		}
+
+		// Schemas older than Gravity Forms 2.3 have no sub_type column, and a
+		// failed query returns an empty result set indistinguishable from "no
+		// notes were written" — which would report a silent mail failure as a
+		// clean zero. Say so instead of counting nothing.
+		if ( ! self::column_exists( $table, 'sub_type' ) ) {
+			$out['reason'] = 'the entry notes table has no sub_type column (Gravity Forms schema older than 2.3), so notification results cannot be classified';
+			return $out;
+		}
+
+		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- table name cannot be bound.
+		$rows = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT sub_type, value, date_created
+				 FROM `{$table}`
+				 WHERE entry_id = %d AND note_type = %s
+				 ORDER BY id",
+				$entry_id,
+				'notification'
+			),
+			ARRAY_A
+		);
+		// phpcs:enable
+
+		if ( ! is_array( $rows ) ) {
+			$out['reason'] = 'the Gravity Forms entry notes table was not readable';
+			return $out;
+		}
+
+		$out['checked'] = true;
+
+		foreach ( $rows as $note ) {
+			$sub = isset( $note['sub_type'] ) ? (string) $note['sub_type'] : '';
+
+			if ( 'success' === $sub ) {
+				++$out['success'];
+			} elseif ( 'error' === $sub ) {
+				++$out['errors'];
+			}
+
+			$out['items'][] = array(
+				// An add-on can write a sub_type of its own, so success + errors
+				// does not always add up to the number of items.
+				'sub_type'   => '' === $sub ? null : $sub,
+				'message'    => self::clip( isset( $note['value'] ) ? $note['value'] : '', 500 ),
+				'created_at' => empty( $note['date_created'] ) ? null : gmdate( 'c', strtotime( $note['date_created'] . ' UTC' ) ),
+			);
+		}
+
+		return $out;
+	}
+
+	/**
+	 * The "not read" shape for notifications.
+	 *
+	 * Same keys whichever way it goes, so the caller never has to test for a
+	 * missing counter: `checked` false alongside a reason is the difference,
+	 * not an absent field. A zero that means "not measured" is exactly the
+	 * thing this plugin refuses to emit.
+	 *
+	 * @param string|null $reason Why the notes were not read.
+	 * @return array
+	 */
+	private static function no_notification_notes( $reason ) {
+		return array(
+			'checked' => false,
+			'reason'  => $reason,
+			'success' => 0,
+			'errors'  => 0,
+			'items'   => array(),
+		);
+	}
+
+	/**
+	 * Cap a note at $limit characters, marking the cut so a truncated SMTP
+	 * transcript can never be read as the whole of what the server said.
+	 *
+	 * @param string $text  Note text.
+	 * @param int    $limit Maximum length of the returned string.
+	 * @return string
+	 */
+	private static function clip( $text, $limit ) {
+		$text = trim( (string) $text );
+		return mb_strlen( $text ) > $limit ? mb_substr( $text, 0, $limit - 1 ) . '…' : $text;
+	}
+
 	/** Does a table exist? Guards every raw-table read above. */
 	private static function table_exists( $table ) {
 		global $wpdb;
 		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.DirectDatabaseQuery
 		return (bool) $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table ) );
+	}
+
+	/**
+	 * Does a column exist? Guards a read that a missing column would answer
+	 * with a silent empty set rather than an error.
+	 */
+	private static function column_exists( $table, $column ) {
+		global $wpdb;
+		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.DirectDatabaseQuery
+		return (bool) $wpdb->get_var( $wpdb->prepare( "SHOW COLUMNS FROM `{$table}` LIKE %s", $column ) );
 	}
 }
 
