@@ -190,7 +190,7 @@ never `0`, which would read as "no attacks" rather than "not measured".
 
 ```jsonc
 {
-  "ok": true, "schema_version": 1, "plugin_version": "1.4.0",
+  "ok": true, "schema_version": 1, "plugin_version": "1.5.0",
   "generated_at": "2026-07-28T03:33:49+00:00",
   "site":      { "siteurl": "…", "home": "…", "is_multisite": false, "server_software": "nginx/1.25.4" },
   "wordpress": { "version": "6.9.4", "latest": "7.0.2", "update_available": true, "checked_at": 1785121264 },
@@ -266,6 +266,125 @@ rather than a misleading empty list.
 Compare `site.home` against the domain you asked about before trusting the numbers — that is what
 stops a staging box quietly answering for production. The support-plan skill's SSH connector does
 the same thing via `siteurl`, flagging `ENV MISMATCH`.
+
+## Entry lookup (added 1.5.0)
+
+```
+GET /wp-json/jb-health/v1/forms/entry?form=<id>&stamp=<run reference>[&hours=24]
+```
+
+The `forms` section says how forms are **configured**. This says what happened to **one specific
+submission**.
+
+`form-check` submits every form on a site and then has to prove two things the browser cannot show
+it: that the entry was actually stored, and that WordPress actually handed the notification to a
+mail server. On a local site it reads the database. On staging, live, or a Loop runner it has
+neither a database nor `wp-cli` — so it asks here instead. Same token, same 401, same
+`Cache-Control: no-store, private`.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  "https://<site>/wp-json/jb-health/v1/forms/entry?form=1&stamp=JBFC-B0D5AB38-F1"
+```
+
+```jsonc
+{
+  "ok": true, "schema_version": 1, "plugin_version": "1.5.0",
+  "generated_at": "2026-09-01T05:25:57+00:00",
+  "site":   { "siteurl": "…", "home": "…", "is_multisite": false, "server_software": "nginx/1.25.4" },
+  "query":  { "form": 1, "stamp": "JBFC-B0D5AB38-F1", "hours": 24 },
+  "engine": "gravityforms",
+  "found":  true,
+  // `status` is reported, never filtered on — see below.
+  "entry":  { "id": 106, "form_id": 1, "status": "active",
+              "created_at": "2026-09-01T05:25:37+00:00", "matched_field": "5" },
+  "notifications": {
+    "checked": true, "reason": null, "success": 2, "errors": 0,
+    "items": [ { "sub_type": "success",
+                 "message": "WordPress successfully passed the notification email to the sending server.",
+                 "created_at": "2026-09-01T05:25:41+00:00" } ] },
+  "reason": null
+}
+```
+
+**200 whether or not the entry is there.** "No entry carrying that stamp" is a result of the check,
+not a transport failure, and folding it into a 404 would make it indistinguishable from this route
+being absent on a site still running 1.4.0 — which is a completely different conclusion. `found:
+false` always arrives with a `reason`, and so does `notifications.checked: false`:
+
+```jsonc
+{ "engine": "gravityforms", "found": false, "entry": null,
+  "notifications": { "checked": false, "reason": "no entry carrying that stamp on form 1 in the last 24h",
+                     "success": 0, "errors": 0, "items": [] },
+  "reason": "no entry carrying that stamp on form 1 in the last 24h" }
+```
+
+The counters are never absent and never guessed: `success: 0` beside `checked: false` means *not
+measured*, exactly as `brute_force` refuses to report `0` for "no security plugin installed".
+
+### The stamp format is the security model
+
+`stamp` must match `^JBFC-[A-F0-9]{8}(-F[0-9]{1,6})?$` — the run reference `form-check` writes into a
+name/text/textarea field before it submits (`JBFC-XXXXXXXX`, suffixed `-F<form id>` for the per-form
+variant). Anything else is rejected with a 400 before a query is built.
+
+That strictness is the entire point. A `?q=<anything>` version of this endpoint would be "search
+every entry on this site for string X", which turns a read-only reporting key into a PII exfiltration
+tool wearing a health-check badge. A caller can only ask about a reference it wrote itself.
+
+Three properties follow from the same reasoning:
+
+- **The response never contains field values.** Only ids, the entry status, timestamps, the
+  `meta_key` of the field the stamp was found in, and Gravity Forms' own notification note text. No
+  names, no email addresses, no IPs, no message bodies. The note text is GF's own system message —
+  on an error it can carry the SMTP failure string, which is operational data rather than personal
+  data, and it is capped at 500 characters.
+- **401 comes before 400.** WordPress does not do this by itself: `WP_REST_Server::dispatch()`
+  validates arguments and hands the resulting error to `respond_to_request()`, which then skips the
+  `permission_callback` because a response already exists. Left alone, a stranger sending a malformed
+  stamp would get a descriptive 400 while the same stranger sending a well-formed one got a 401 —
+  the difference being a free oracle for the argument format, handed out before any credential was
+  examined. A `rest_request_before_callbacks` filter puts the 401 back in front, on this plugin's
+  routes only. An authorised caller still gets the descriptive 400: WordPress's own
+  `rest_invalid_param`, carrying `jb_health_bad_stamp` / `jb_health_bad_form` /
+  `jb_health_bad_hours` in `data.details`.
+- **`hours` (1–168, default 24) bounds the scan.** `meta_value` carries no index a leading-wildcard
+  `LIKE` can use, so the `date_created` window is what does the narrowing — an unbounded search
+  across an entry meta table with years of rows in it is a denial of service dressed as a query
+  string.
+
+### What the notification block proves — and what it does not
+
+Gravity Forms writes one note per notification attempt from
+`GFFormsModel::add_notification_note()`, **present since GF 2.4.14**, into `{prefix}gf_entry_notes`
+with `note_type = 'notification'` and a `sub_type` of `success` or `error`. The success text is GF's
+own "WordPress successfully passed the notification email to the sending server"; the error text
+carries the reason (an invalid TO address, or whatever PHPMailer's `ErrorInfo` said).
+
+| It proves | It does not prove |
+|---|---|
+| The entry was stored, and with what `status` | That the email reached an inbox |
+| WordPress handed the mail to the sending server | That the sending server delivered it |
+| Which notifications errored, and why | Anything on a site older than GF 2.4.14 |
+
+So `success` means **accepted**, not **delivered**: SPF/DKIM failures, a full mailbox and spam
+filing all happen downstream of the last thing this can see. It is still the difference between "the
+form quietly mails nobody" and "the mail left the building" — and `form-check` checks a real inbox
+as well wherever it can reach one.
+
+Two honest limits on top of that:
+
+- **Absence of a note is not proof of failure.** GF writes the note only when `wp_mail()` returned a
+  plain `true` or `false`; a `WP_Error` from a filtering plugin produces no note at all. And on a
+  schema older than GF 2.3 the notes table has no `sub_type` column, which is reported as
+  `checked: false` with a reason rather than counted as zero.
+- **The entry status is reported, never filtered on.** A test submission that landed in `spam` or
+  `trash` is a **finding** — the form works, but the entry is being thrown away. This is the one
+  place the plugin deliberately parts company with the `forms` section, which excludes trash and
+  spam because it is counting genuine volume.
+
+Gravity Forms only, exactly like `forms`: any other form plugin returns `engine: null` and a reason
+rather than a misleading `found: false`.
 
 ## A note on PHP version accuracy
 
