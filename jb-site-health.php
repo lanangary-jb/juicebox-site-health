@@ -2,7 +2,7 @@
 /**
  * Plugin Name: JB Site Health
  * Description: Read-only site-health endpoint for the Juicebox Digital Support Plan report. Returns the data points that cannot be observed from outside the site — WordPress/PHP version, plugin update status, hardening flags, and brute-force counts.
- * Version:     1.5.0
+ * Version:     1.6.0
  * Author:      Juicebox Creative
  * License:     Proprietary — internal Juicebox use only
  *
@@ -89,7 +89,7 @@ if ( ! defined( 'JB_HEALTH_SIGNING_PUBKEYS' ) ) {
 	);
 }
 define( 'JB_HEALTH_SIGN_CONTEXT', 'jb-health-v1:' );
-define( 'JB_HEALTH_VERSION', '1.5.0' );
+define( 'JB_HEALTH_VERSION', '1.6.0' );
 define( 'JB_HEALTH_SCHEMA', 1 );
 
 /**
@@ -1019,6 +1019,7 @@ final class JB_Site_Health {
 		}
 
 		$stats = self::entry_stats();
+		$notes = self::notification_stats();
 		$items = array();
 
 		foreach ( $forms as $form ) {
@@ -1035,6 +1036,10 @@ final class JB_Site_Health {
 				'entries_30d'       => $s ? (int) $s['last30'] : 0,
 				'entries_prev_30d'  => $s ? (int) $s['prev30'] : 0,
 				'last_entry'        => $s && $s['last_entry'] ? gmdate( 'c', strtotime( $s['last_entry'] . ' UTC' ) ) : null,
+				// The site's own email log for this form: what Gravity Forms
+				// recorded about every notification it tried to send in the last
+				// 30 days. Added 1.6.0; purely additive, schema unchanged.
+				'notifications_30d' => self::notification_window( $notes, $id ),
 			);
 		}
 
@@ -1184,6 +1189,172 @@ final class JB_Site_Health {
 			$out[ (int) $r['form_id'] ] = $r;
 		}
 		return $out;
+	}
+
+	/**
+	 * Notification outcomes for every form over the last 60 days, in one query.
+	 *
+	 * This is the site's own email log. Gravity Forms writes one entry note per
+	 * notification attempt (GFFormsModel::add_notification_note(), GF >= 2.4.14):
+	 * sub_type 'success' when wp_mail() handed the message to the sending
+	 * server, 'error' with the underlying reason when it did not. Counting those
+	 * per form answers "are this form's real submissions being emailed?" without
+	 * submitting anything — the only evidence available for a form an unattended
+	 * check cannot exercise (a captcha gate, say), and the one that matters after
+	 * an update: the form kept working for real people, or it did not.
+	 *
+	 * Accepted by the sending server is the honest ceiling: a bounce or a spam
+	 * folder downstream is invisible here. The last error text is returned per
+	 * form because it usually IS the diagnosis (an invalid TO address, an SMTP
+	 * refusal). It is GF's own system message, never visitor input.
+	 *
+	 * Two windows, like entry_stats(): the current 30 days and the 30 before,
+	 * so a caller can see a form's sends collapse rather than just read a zero.
+	 *
+	 * @return array {checked, reason, forms => [form_id => window]}
+	 */
+	private static function notification_stats() {
+		global $wpdb;
+
+		$out     = array(
+			'checked' => false,
+			'reason'  => null,
+			'forms'   => array(),
+		);
+		$notes   = $wpdb->prefix . 'gf_entry_notes';
+		$entries = $wpdb->prefix . 'gf_entry';
+
+		if ( ! self::table_exists( $notes ) || ! self::table_exists( $entries ) ) {
+			$out['reason'] = 'the Gravity Forms entry notes table is not present on this site';
+			return $out;
+		}
+		if ( ! self::column_exists( $notes, 'sub_type' ) ) {
+			$out['reason'] = 'the entry notes table has no sub_type column (Gravity Forms schema older than 2.3), so notification results cannot be classified';
+			return $out;
+		}
+
+		$now = time();
+		$d30 = gmdate( 'Y-m-d H:i:s', $now - ( 30 * DAY_IN_SECONDS ) );
+		$d60 = gmdate( 'Y-m-d H:i:s', $now - ( 60 * DAY_IN_SECONDS ) );
+
+		// The notes table carries no form id, so it is joined to the entry table
+		// for it. Entry status is deliberately NOT filtered: a note exists only
+		// because a send was attempted, and a later trash/spam flag on the entry
+		// does not un-send the mail.
+		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- table names cannot be bound.
+		$rows = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT e.form_id, n.sub_type,
+				        SUM(n.date_created >= %s) AS last30,
+				        SUM(n.date_created < %s) AS prev30,
+				        MAX(n.date_created) AS last_at
+				 FROM `{$notes}` n
+				 JOIN `{$entries}` e ON e.id = n.entry_id
+				 WHERE n.note_type = 'notification' AND n.date_created >= %s
+				 GROUP BY e.form_id, n.sub_type",
+				$d30,
+				$d30,
+				$d60
+			),
+			ARRAY_A
+		);
+		// phpcs:enable
+
+		if ( ! is_array( $rows ) ) {
+			$out['reason'] = 'the Gravity Forms entry notes table was not readable';
+			return $out;
+		}
+
+		foreach ( $rows as $r ) {
+			$id  = (int) $r['form_id'];
+			$sub = isset( $r['sub_type'] ) ? (string) $r['sub_type'] : '';
+			if ( ! isset( $out['forms'][ $id ] ) ) {
+				$out['forms'][ $id ] = self::empty_notification_window();
+			}
+			$last = empty( $r['last_at'] ) ? null : gmdate( 'c', strtotime( $r['last_at'] . ' UTC' ) );
+
+			if ( 'success' === $sub ) {
+				$out['forms'][ $id ]['sent']             = (int) $r['last30'];
+				$out['forms'][ $id ]['prev_30d']['sent'] = (int) $r['prev30'];
+				$out['forms'][ $id ]['last_sent_at']     = $last;
+			} elseif ( 'error' === $sub ) {
+				$out['forms'][ $id ]['failed']             = (int) $r['last30'];
+				$out['forms'][ $id ]['prev_30d']['failed'] = (int) $r['prev30'];
+				$out['forms'][ $id ]['last_failed_at']     = $last;
+			}
+			// An add-on can write a sub_type of its own; those are neither, and
+			// are left out rather than guessed at.
+		}
+
+		// The most recent error text per form (30 days), because it usually names
+		// the cause. Capped: an SMTP error can carry an entire server transcript.
+		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- table names cannot be bound.
+		$errs = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT e.form_id, n.value
+				 FROM `{$notes}` n
+				 JOIN `{$entries}` e ON e.id = n.entry_id
+				 WHERE n.note_type = 'notification' AND n.sub_type = 'error' AND n.date_created >= %s
+				 ORDER BY n.id DESC
+				 LIMIT 200",
+				$d30
+			),
+			ARRAY_A
+		);
+		// phpcs:enable
+
+		if ( is_array( $errs ) ) {
+			foreach ( $errs as $r ) {
+				$id = (int) $r['form_id'];
+				if ( isset( $out['forms'][ $id ] ) && null === $out['forms'][ $id ]['last_error'] ) {
+					$out['forms'][ $id ]['last_error'] = self::clip( isset( $r['value'] ) ? $r['value'] : '', 500 );
+				}
+			}
+		}
+
+		$out['checked'] = true;
+		return $out;
+	}
+
+	/**
+	 * The zero shape of a form's 30-day notification window. Every key present
+	 * whether or not anything was sent, so a caller never tests for a missing
+	 * counter; `checked` false plus a reason is how "not measured" is told apart
+	 * from "nothing sent".
+	 *
+	 * @return array
+	 */
+	private static function empty_notification_window() {
+		return array(
+			'checked'        => true,
+			'reason'         => null,
+			'sent'           => 0,
+			'failed'         => 0,
+			'prev_30d'       => array(
+				'sent'   => 0,
+				'failed' => 0,
+			),
+			'last_sent_at'   => null,
+			'last_failed_at' => null,
+			'last_error'     => null,
+		);
+	}
+
+	/**
+	 * One form's view of notification_stats().
+	 *
+	 * @param array $stats   Result of notification_stats().
+	 * @param int   $form_id Gravity Forms form id.
+	 * @return array
+	 */
+	private static function notification_window( $stats, $form_id ) {
+		if ( empty( $stats['checked'] ) ) {
+			$w            = self::empty_notification_window();
+			$w['checked'] = false;
+			$w['reason']  = isset( $stats['reason'] ) ? $stats['reason'] : null;
+			return $w;
+		}
+		return isset( $stats['forms'][ $form_id ] ) ? $stats['forms'][ $form_id ] : self::empty_notification_window();
 	}
 
 	/**
