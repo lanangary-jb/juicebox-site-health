@@ -1644,14 +1644,28 @@ final class JB_Site_Health {
 				? substr( (string) $e['sg_event_id'], 0, 120 )
 				: md5( wp_json_encode( $e ) );
 
-			// The provider's own words about a non-delivery: bounce `reason`,
-			// deferred `response`, dropped `reason` + `status`. Capped — an SMTP
-			// transcript can be long.
-			$reason = array();
-			foreach ( array( 'reason', 'response', 'status', 'type' ) as $k ) {
-				if ( ! empty( $e[ $k ] ) && is_scalar( $e[ $k ] ) ) {
-					$reason[] = $k . ': ' . (string) $e[ $k ];
+			// The provider's own words about a non-delivery: a bounce's `reason`,
+			// a deferral's `response`. Kept as the sentence SendGrid wrote, because
+			// this line is read by a client in a support report — the SMTP status
+			// is appended only when the sentence does not already contain it, and
+			// the event `type` only when nothing else said anything. Capped: an
+			// SMTP transcript can be long.
+			$reason = '';
+			foreach ( array( 'reason', 'response' ) as $k ) {
+				if ( '' === $reason && ! empty( $e[ $k ] ) && is_scalar( $e[ $k ] ) ) {
+					$reason = trim( (string) $e[ $k ] );
 				}
+			}
+			if ( ! empty( $e['status'] ) && is_scalar( $e['status'] ) ) {
+				$status = trim( (string) $e['status'] );
+				if ( '' === $reason ) {
+					$reason = $status;
+				} elseif ( false === strpos( $reason, $status ) ) {
+					$reason .= ' (' . $status . ')';
+				}
+			}
+			if ( '' === $reason && ! empty( $e['type'] ) && is_scalar( $e['type'] ) ) {
+				$reason = trim( (string) $e['type'] );
 			}
 
 			// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- table name cannot be bound.
@@ -1663,7 +1677,7 @@ final class JB_Site_Health {
 					isset( $e['sg_message_id'] ) && is_scalar( $e['sg_message_id'] ) ? substr( (string) $e['sg_message_id'], 0, 191 ) : '',
 					$email,
 					$event,
-					self::clip( implode( ' · ', $reason ), 500 ),
+					self::clip( $reason, 500 ),
 					isset( $e['timestamp'] ) && is_numeric( $e['timestamp'] ) ? (int) $e['timestamp'] : time(),
 					gmdate( 'Y-m-d H:i:s' )
 				)
