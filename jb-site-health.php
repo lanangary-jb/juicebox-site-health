@@ -2,7 +2,7 @@
 /**
  * Plugin Name: JB Site Health
  * Description: Read-only site-health endpoint for the Juicebox Digital Support Plan report. Returns the data points that cannot be observed from outside the site — WordPress/PHP version, plugin update status, hardening flags, and brute-force counts.
- * Version:     1.6.0
+ * Version:     1.7.0
  * Author:      Juicebox Creative
  * License:     Proprietary — internal Juicebox use only
  *
@@ -89,7 +89,7 @@ if ( ! defined( 'JB_HEALTH_SIGNING_PUBKEYS' ) ) {
 	);
 }
 define( 'JB_HEALTH_SIGN_CONTEXT', 'jb-health-v1:' );
-define( 'JB_HEALTH_VERSION', '1.6.0' );
+define( 'JB_HEALTH_VERSION', '1.7.0' );
 define( 'JB_HEALTH_SCHEMA', 1 );
 
 /**
@@ -160,6 +160,24 @@ final class JB_Site_Health {
 						'sanitize_callback' => 'absint',
 					),
 				),
+			)
+		);
+
+		/**
+		 * Delivery events — SendGrid's Event Webhook posts here (added 1.7.0).
+		 *
+		 * Authenticated by SendGrid's own signature over the body, NOT by the
+		 * fleet token: the caller is SendGrid, and the fleet key must stay a
+		 * read-only credential. No `args` on purpose — the body is a raw JSON
+		 * array that is verified before it is parsed (see handle_mail_events).
+		 */
+		register_rest_route(
+			'jb-health/v1',
+			'/mail-events',
+			array(
+				'methods'             => 'POST',
+				'callback'            => array( __CLASS__, 'handle_mail_events' ),
+				'permission_callback' => '__return_true',
 			)
 		);
 	}
@@ -996,6 +1014,11 @@ final class JB_Site_Health {
 			'reason'                => null,
 		);
 
+		// What the sending provider said about the last 30 days of mail (1.7.0):
+		// delivered / bounced / dropped counts from SendGrid's Event Webhook.
+		// Site-wide, not per form — events carry the recipient, not the form.
+		$out['mailer']['delivery_30d'] = self::mail_delivery_30d();
+
 		if ( ! class_exists( 'GFAPI' ) || ! class_exists( 'GFCommon' ) ) {
 			$out['reason'] = 'Gravity Forms is not active on this site; no other form plugin is supported yet';
 			return $out;
@@ -1422,6 +1445,528 @@ final class JB_Site_Health {
 	}
 
 	// ----------------------------------------------------------------- //
+	// Delivery events (SendGrid Event Webhook) — added 1.7.0
+	// ----------------------------------------------------------------- //
+
+	/**
+	 * The subuser's Event Webhook verification key (base64 DER public key,
+	 * copied from SendGrid → Settings → Mail Settings → Event Webhook).
+	 *
+	 * Constant, then environment, then option — so it can travel in the
+	 * deployed .env like every other per-site secret, or be set with WP-CLI on
+	 * a site that has no deploy pipeline. Empty means the feature is off and
+	 * every delivery answer says so, rather than pretending "no events".
+	 *
+	 * @return string
+	 */
+	private static function sendgrid_pubkey() {
+		if ( defined( 'JB_HEALTH_SENDGRID_PUBKEY' ) && JB_HEALTH_SENDGRID_PUBKEY ) {
+			return trim( (string) JB_HEALTH_SENDGRID_PUBKEY );
+		}
+		// Bedrock loads .env with Dotenv; depending on the template's vintage the
+		// values land in putenv(), $_ENV or $_SERVER — check all three, so the
+		// deploy pipeline's `PROD_JB_HEALTH_SENDGRID_PUBKEY` repo variable works
+		// on every site without a code change.
+		foreach ( array( getenv( 'JB_HEALTH_SENDGRID_PUBKEY' ), isset( $_ENV['JB_HEALTH_SENDGRID_PUBKEY'] ) ? $_ENV['JB_HEALTH_SENDGRID_PUBKEY'] : null, isset( $_SERVER['JB_HEALTH_SENDGRID_PUBKEY'] ) ? $_SERVER['JB_HEALTH_SENDGRID_PUBKEY'] : null ) as $env ) { // phpcs:ignore WordPress.Security.ValidatedSanitizedInput
+			if ( is_string( $env ) && '' !== trim( $env ) ) {
+				return trim( $env );
+			}
+		}
+		$opt = get_option( 'jb_health_sendgrid_pubkey' );
+		return is_string( $opt ) ? trim( $opt ) : '';
+	}
+
+	/** Name of the events table. */
+	private static function mail_events_table() {
+		global $wpdb;
+		return $wpdb->prefix . 'jb_health_mail_events';
+	}
+
+	/**
+	 * POST /wp-json/jb-health/v1/mail-events — receive SendGrid's Event Webhook.
+	 *
+	 * Verification is SendGrid's signed-webhook scheme: an ECDSA/SHA-256
+	 * signature over `timestamp . body`, checked against the subuser's public
+	 * key. Nothing is parsed until the signature holds, and an unconfigured
+	 * site answers 403 so a misdirected webhook is loud in SendGrid's own
+	 * activity feed rather than silently absorbed.
+	 *
+	 * Stored: recipient, event, timestamp, the provider's reason. Never a
+	 * subject, never a body — this is a delivery ledger, not a mail archive,
+	 * and it keeps seven days.
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return WP_REST_Response
+	 */
+	public static function handle_mail_events( $request ) {
+		$pub = self::sendgrid_pubkey();
+		if ( '' === $pub ) {
+			return new WP_REST_Response(
+				array(
+					'ok'      => false,
+					'code'    => 'jb_health_webhook_unconfigured',
+					'message' => 'this site has no SendGrid Event Webhook verification key (JB_HEALTH_SENDGRID_PUBKEY)',
+				),
+				403
+			);
+		}
+
+		$body = (string) $request->get_body();
+		if ( strlen( $body ) > 2 * 1024 * 1024 ) {
+			return new WP_REST_Response( array( 'ok' => false, 'code' => 'jb_health_webhook_too_large' ), 413 );
+		}
+
+		$signature = (string) $request->get_header( 'X-Twilio-Email-Event-Webhook-Signature' );
+		$timestamp = (string) $request->get_header( 'X-Twilio-Email-Event-Webhook-Timestamp' );
+
+		if ( ! self::verify_sendgrid_signature( $pub, $timestamp, $body, $signature ) ) {
+			return new WP_REST_Response(
+				array(
+					'ok'      => false,
+					'code'    => 'jb_health_webhook_signature',
+					'message' => 'the request is not signed by the configured SendGrid Event Webhook key',
+				),
+				401
+			);
+		}
+
+		$events = json_decode( $body, true );
+		if ( ! is_array( $events ) ) {
+			return new WP_REST_Response( array( 'ok' => false, 'code' => 'jb_health_webhook_body' ), 400 );
+		}
+
+		$stored = self::store_mail_events( $events );
+
+		$response = new WP_REST_Response(
+			array(
+				'ok'       => true,
+				'received' => count( $events ),
+				'stored'   => $stored,
+			),
+			200
+		);
+		$response->header( 'Cache-Control', 'no-store, private' );
+		return $response;
+	}
+
+	/**
+	 * SendGrid's signed Event Webhook: ECDSA (P-256) / SHA-256 over
+	 * `timestamp . payload`, public key as base64 DER.
+	 *
+	 * The timestamp header is Unix seconds for THIS request (a retry is
+	 * re-signed), so a 24h tolerance covers SendGrid's own retry window while
+	 * refusing an ancient capture. Replaying a captured request can only
+	 * re-insert events that already exist (unique sg_event_id), so it changes
+	 * nothing.
+	 *
+	 * @param string $pub_b64   Base64 DER public key.
+	 * @param string $timestamp Header value.
+	 * @param string $body      Raw request body.
+	 * @param string $sig_b64   Base64 signature header.
+	 * @return bool
+	 */
+	private static function verify_sendgrid_signature( $pub_b64, $timestamp, $body, $sig_b64 ) {
+		if ( ! function_exists( 'openssl_verify' ) || '' === $timestamp || '' === $sig_b64 ) {
+			return false;
+		}
+		if ( ! ctype_digit( $timestamp ) || abs( time() - (int) $timestamp ) > DAY_IN_SECONDS ) {
+			return false;
+		}
+		$sig = base64_decode( $sig_b64, true );
+		if ( false === $sig ) {
+			return false;
+		}
+		$pem = "-----BEGIN PUBLIC KEY-----\n" . chunk_split( preg_replace( '/\s+/', '', $pub_b64 ), 64, "\n" ) . "-----END PUBLIC KEY-----\n";
+		$key = openssl_pkey_get_public( $pem );
+		if ( false === $key ) {
+			return false;
+		}
+		return 1 === openssl_verify( $timestamp . $body, $sig, $key, OPENSSL_ALGO_SHA256 );
+	}
+
+	/** Create the events table on first use. */
+	private static function ensure_mail_events_table() {
+		global $wpdb;
+		$table = self::mail_events_table();
+		if ( self::table_exists( $table ) ) {
+			return true;
+		}
+		require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+		$charset = $wpdb->get_charset_collate();
+		dbDelta(
+			"CREATE TABLE {$table} (
+				id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+				sg_event_id varchar(120) NOT NULL,
+				sg_message_id varchar(191) NULL,
+				email varchar(191) NOT NULL,
+				event varchar(32) NOT NULL,
+				reason text NULL,
+				event_ts int(11) unsigned NOT NULL,
+				received_at datetime NOT NULL,
+				PRIMARY KEY  (id),
+				UNIQUE KEY sg_event_id (sg_event_id),
+				KEY email_ts (email(100), event_ts),
+				KEY event_ts (event_ts)
+			) {$charset};"
+		);
+		return self::table_exists( $table );
+	}
+
+	/**
+	 * Insert a batch of events, idempotently (sg_event_id is unique), and
+	 * drop anything older than seven days.
+	 *
+	 * @param array $events Decoded webhook batch.
+	 * @return int Rows actually inserted.
+	 */
+	private static function store_mail_events( array $events ) {
+		global $wpdb;
+		if ( ! self::ensure_mail_events_table() ) {
+			return 0;
+		}
+		$table  = self::mail_events_table();
+		$stored = 0;
+		$seen   = 0;
+
+		foreach ( $events as $e ) {
+			if ( ++$seen > 2000 ) {
+				break;
+			}
+			if ( ! is_array( $e ) ) {
+				continue;
+			}
+			$email = isset( $e['email'] ) && is_string( $e['email'] ) ? strtolower( sanitize_email( $e['email'] ) ) : '';
+			$event = isset( $e['event'] ) && is_string( $e['event'] ) ? substr( sanitize_key( $e['event'] ), 0, 32 ) : '';
+			if ( '' === $email || '' === $event ) {
+				continue;
+			}
+			$event_id = isset( $e['sg_event_id'] ) && is_scalar( $e['sg_event_id'] )
+				? substr( (string) $e['sg_event_id'], 0, 120 )
+				: md5( wp_json_encode( $e ) );
+
+			// The provider's own words about a non-delivery: bounce `reason`,
+			// deferred `response`, dropped `reason` + `status`. Capped — an SMTP
+			// transcript can be long.
+			$reason = array();
+			foreach ( array( 'reason', 'response', 'status', 'type' ) as $k ) {
+				if ( ! empty( $e[ $k ] ) && is_scalar( $e[ $k ] ) ) {
+					$reason[] = $k . ': ' . (string) $e[ $k ];
+				}
+			}
+
+			// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- table name cannot be bound.
+			$rows = $wpdb->query(
+				$wpdb->prepare(
+					"INSERT IGNORE INTO `{$table}` (sg_event_id, sg_message_id, email, event, reason, event_ts, received_at)
+					 VALUES (%s, %s, %s, %s, %s, %d, %s)",
+					$event_id,
+					isset( $e['sg_message_id'] ) && is_scalar( $e['sg_message_id'] ) ? substr( (string) $e['sg_message_id'], 0, 191 ) : '',
+					$email,
+					$event,
+					self::clip( implode( ' · ', $reason ), 500 ),
+					isset( $e['timestamp'] ) && is_numeric( $e['timestamp'] ) ? (int) $e['timestamp'] : time(),
+					gmdate( 'Y-m-d H:i:s' )
+				)
+			);
+			// phpcs:enable
+			if ( $rows ) {
+				++$stored;
+			}
+		}
+
+		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.DirectDatabaseQuery
+		$wpdb->query( $wpdb->prepare( "DELETE FROM `{$table}` WHERE event_ts < %d", time() - ( 7 * DAY_IN_SECONDS ) ) );
+
+		return $stored;
+	}
+
+	/**
+	 * What the provider reported about the notification(s) sent for ONE entry.
+	 *
+	 * Events carry the recipient, not the form or the entry, so the match is
+	 * "an event for one of this form's notification recipients, from the
+	 * moment Gravity Forms logged the send for this entry to thirty minutes
+	 * after". The lower bound matters: a notification cannot be delivered
+	 * before it was sent, and any look-back lets an EARLIER message to the
+	 * same address stand in for this one — a fake pass (seen in testing with
+	 * two runs 12 seconds apart). Two submissions to the same recipient in
+	 * the same half hour can still share an event; the check submits once
+	 * per form per run, so that is a corner, and it is documented as one.
+	 * Status vocabulary, worst first:
+	 * bounced · dropped · deferred · processed · pending (nothing yet) ·
+	 * delivered; `summary` rolls the recipients up the same way.
+	 *
+	 * "delivered" means the RECIPIENT'S mail server accepted the message. It is
+	 * one step further than the notification log (our server handed it over),
+	 * and still not a promise about a spam folder.
+	 *
+	 * @param int   $form_id Gravity Forms form id.
+	 * @param array $row     Entry row: id, date_created.
+	 * @return array
+	 */
+	private static function entry_delivery( $form_id, array $row ) {
+		global $wpdb;
+
+		$out = array(
+			'configured' => '' !== self::sendgrid_pubkey(),
+			'checked'    => false,
+			'reason'     => null,
+			'summary'    => 'unknown',
+			'window'     => array( 'before_s' => 0, 'after_s' => 1800 ),
+			'recipients' => array(),
+		);
+
+		if ( ! $out['configured'] ) {
+			$out['reason'] = 'this site has no SendGrid Event Webhook key (JB_HEALTH_SENDGRID_PUBKEY), so provider delivery events are not collected';
+			return $out;
+		}
+		$table = self::mail_events_table();
+		if ( ! self::table_exists( $table ) ) {
+			$out['reason'] = 'no delivery events have been received yet — check the subuser’s Event Webhook URL points at /wp-json/jb-health/v1/mail-events';
+			return $out;
+		}
+
+		$form  = GFAPI::get_form( $form_id );
+		$entry = GFAPI::get_entry( (int) $row['id'] );
+		if ( ! is_array( $form ) || is_wp_error( $entry ) || ! is_array( $entry ) ) {
+			$out['reason'] = 'could not load the form or the entry to resolve its notification recipients';
+			return $out;
+		}
+
+		$recipients = self::notification_recipients( $form, $entry );
+		if ( empty( $recipients ) ) {
+			$out['reason'] = 'none of the form’s active submission notifications has a resolvable recipient (routing rules are not resolved)';
+			return $out;
+		}
+
+		$created = empty( $row['date_created'] ) ? time() : strtotime( $row['date_created'] . ' UTC' );
+
+		// The floor is the moment Gravity Forms logged the FIRST notification
+		// attempt for this entry — the send itself — falling back to the entry's
+		// creation. No look-back: an event before the send belongs to an earlier
+		// message to the same address, and counting it would be a fake pass.
+		$floor = $created;
+		$notes = $wpdb->prefix . 'gf_entry_notes';
+		if ( self::table_exists( $notes ) ) {
+			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.DirectDatabaseQuery
+			$first_note = $wpdb->get_var( $wpdb->prepare( "SELECT MIN(date_created) FROM `{$notes}` WHERE entry_id = %d AND note_type = %s", (int) $row['id'], 'notification' ) );
+			if ( $first_note ) {
+				$floor = max( $floor, (int) strtotime( $first_note . ' UTC' ) );
+			}
+		}
+		$from = $floor - $out['window']['before_s'];
+		$to   = $floor + $out['window']['after_s'];
+		$out['window']['from'] = gmdate( 'c', $from );
+
+		$out['checked'] = true;
+		$statuses       = array();
+
+		foreach ( $recipients as $addr ) {
+			// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- table name cannot be bound.
+			$rows = $wpdb->get_results(
+				$wpdb->prepare(
+					"SELECT event, reason, event_ts FROM `{$table}` WHERE email = %s AND event_ts BETWEEN %d AND %d ORDER BY event_ts, id",
+					$addr,
+					$from,
+					$to
+				),
+				ARRAY_A
+			);
+			// phpcs:enable
+
+			$events = array();
+			$names  = array();
+			foreach ( (array) $rows as $r ) {
+				$names[]  = $r['event'];
+				$events[] = array(
+					'event'  => $r['event'],
+					'at'     => gmdate( 'c', (int) $r['event_ts'] ),
+					'reason' => '' === (string) $r['reason'] ? null : $r['reason'],
+				);
+			}
+
+			if ( in_array( 'bounce', $names, true ) ) {
+				$status = 'bounced';
+			} elseif ( in_array( 'dropped', $names, true ) ) {
+				$status = 'dropped';
+			} elseif ( in_array( 'delivered', $names, true ) ) {
+				$status = 'delivered';
+			} elseif ( in_array( 'deferred', $names, true ) ) {
+				$status = 'deferred';
+			} elseif ( in_array( 'processed', $names, true ) ) {
+				$status = 'processed';
+			} else {
+				$status = 'pending';
+			}
+			$statuses[]          = $status;
+			$out['recipients'][] = array(
+				'to'     => $addr,
+				'status' => $status,
+				'events' => $events,
+			);
+		}
+
+		if ( in_array( 'bounced', $statuses, true ) ) {
+			$out['summary'] = 'bounced';
+		} elseif ( in_array( 'dropped', $statuses, true ) ) {
+			$out['summary'] = 'dropped';
+		} elseif ( count( array_unique( $statuses ) ) === 1 && 'delivered' === $statuses[0] ) {
+			$out['summary'] = 'delivered';
+		} elseif ( in_array( 'delivered', $statuses, true ) ) {
+			$out['summary'] = 'partial';
+		} elseif ( in_array( 'deferred', $statuses, true ) ) {
+			$out['summary'] = 'deferred';
+		} elseif ( in_array( 'processed', $statuses, true ) ) {
+			$out['summary'] = 'processed';
+		} else {
+			$out['summary'] = 'pending';
+		}
+
+		return $out;
+	}
+
+	/**
+	 * The addresses a form's active submission notifications go to, for one
+	 * entry, with merge tags resolved ({admin_email}, a field the visitor
+	 * typed). Routing-type notifications are skipped rather than guessed.
+	 *
+	 * @param array $form  Gravity Forms form.
+	 * @param array $entry Gravity Forms entry.
+	 * @return string[] Lower-cased, de-duplicated addresses.
+	 */
+	private static function notification_recipients( array $form, array $entry ) {
+		$out = array();
+		if ( empty( $form['notifications'] ) || ! is_array( $form['notifications'] ) ) {
+			return $out;
+		}
+		foreach ( $form['notifications'] as $n ) {
+			if ( ! is_array( $n ) ) {
+				continue;
+			}
+			if ( isset( $n['isActive'] ) && ! $n['isActive'] ) {
+				continue;
+			}
+			if ( isset( $n['event'] ) && 'form_submission' !== $n['event'] ) {
+				continue;
+			}
+			$to_type = isset( $n['toType'] ) ? (string) $n['toType'] : 'email';
+			$raw     = '';
+			if ( 'field' === $to_type ) {
+				$field_id = isset( $n['toField'] ) ? (string) $n['toField'] : ( isset( $n['to'] ) ? (string) $n['to'] : '' );
+				$raw      = '' === $field_id ? '' : (string) rgar( $entry, $field_id );
+			} elseif ( 'routing' !== $to_type ) {
+				$raw = isset( $n['to'] ) ? (string) $n['to'] : '';
+			}
+			if ( '' === $raw ) {
+				continue;
+			}
+			if ( class_exists( 'GFCommon' ) && false !== strpos( $raw, '{' ) ) {
+				$raw = GFCommon::replace_variables( $raw, $form, $entry, false, false, false, 'text' );
+			}
+			foreach ( preg_split( '/[,;]+/', $raw ) as $addr ) {
+				$addr = strtolower( trim( $addr ) );
+				if ( '' !== $addr && is_email( $addr ) ) {
+					$out[ $addr ] = true;
+				}
+			}
+		}
+		return array_keys( $out );
+	}
+
+	/**
+	 * Site-wide delivery outcome for the last 30 days, from the events table.
+	 * Events carry the recipient, not the form, so this is the whole site's
+	 * mail — the number that says "the client actually receives what this site
+	 * sends", and the bounce that says which address is dead.
+	 *
+	 * @return array
+	 */
+	private static function mail_delivery_30d() {
+		global $wpdb;
+
+		$out = array(
+			'webhook_configured' => '' !== self::sendgrid_pubkey(),
+			'checked'            => false,
+			'reason'             => null,
+			'delivered'          => 0,
+			'bounced'            => 0,
+			'dropped'            => 0,
+			'deferred'           => 0,
+			'last_event_at'      => null,
+			'last_bounce'        => null,
+		);
+
+		if ( ! $out['webhook_configured'] ) {
+			$out['reason'] = 'no SendGrid Event Webhook key on this site (JB_HEALTH_SENDGRID_PUBKEY)';
+			return $out;
+		}
+		$table = self::mail_events_table();
+		if ( ! self::table_exists( $table ) ) {
+			$out['reason'] = 'no delivery events received yet — check the subuser’s Event Webhook URL';
+			return $out;
+		}
+
+		$d30 = time() - ( 30 * DAY_IN_SECONDS );
+
+		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- table name cannot be bound.
+		$rows = $wpdb->get_results(
+			$wpdb->prepare( "SELECT event, COUNT(*) AS c, MAX(event_ts) AS last_ts FROM `{$table}` WHERE event_ts >= %d GROUP BY event", $d30 ),
+			ARRAY_A
+		);
+		// phpcs:enable
+		if ( ! is_array( $rows ) ) {
+			$out['reason'] = 'the delivery events table was not readable';
+			return $out;
+		}
+
+		$out['checked'] = true;
+		$last           = 0;
+		$map            = array(
+			'delivered' => 'delivered',
+			'bounce'    => 'bounced',
+			'dropped'   => 'dropped',
+			'deferred'  => 'deferred',
+		);
+		foreach ( $rows as $r ) {
+			if ( isset( $map[ $r['event'] ] ) ) {
+				$out[ $map[ $r['event'] ] ] = (int) $r['c'];
+			}
+			$last = max( $last, (int) $r['last_ts'] );
+		}
+		$out['last_event_at'] = $last ? gmdate( 'c', $last ) : null;
+
+		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- table name cannot be bound.
+		$b = $wpdb->get_row(
+			$wpdb->prepare(
+				"SELECT email, event, reason, event_ts FROM `{$table}` WHERE event IN ('bounce','dropped') AND event_ts >= %d ORDER BY event_ts DESC, id DESC LIMIT 1",
+				$d30
+			),
+			ARRAY_A
+		);
+		// phpcs:enable
+		if ( $b ) {
+			$out['last_bounce'] = array(
+				'to'     => self::mask_email( $b['email'] ),
+				'event'  => $b['event'],
+				'reason' => '' === (string) $b['reason'] ? null : $b['reason'],
+				'at'     => gmdate( 'c', (int) $b['event_ts'] ),
+			);
+		}
+
+		return $out;
+	}
+
+	/** j***@example.com — enough to recognise an address, not enough to harvest it. */
+	private static function mask_email( $email ) {
+		$email = (string) $email;
+		$at    = strpos( $email, '@' );
+		if ( false === $at ) {
+			return $email;
+		}
+		return substr( $email, 0, 1 ) . '***' . substr( $email, $at );
+	}
+
+	// ----------------------------------------------------------------- //
 	// Entry lookup
 	// ----------------------------------------------------------------- //
 
@@ -1562,6 +2107,10 @@ final class JB_Site_Health {
 			'found'         => false,
 			'entry'         => null,
 			'notifications' => self::no_notification_notes( null ),
+			// What the sending provider reported about the notification(s) for
+			// THIS entry — delivered / bounced / deferred per recipient (1.7.0).
+			// null until the entry is found.
+			'delivery'      => null,
 			'reason'        => null,
 		);
 
@@ -1624,6 +2173,7 @@ final class JB_Site_Health {
 			'matched_field' => isset( $row['meta_key'] ) ? (string) $row['meta_key'] : null,
 		);
 		$out['notifications'] = self::notification_notes( (int) $row['id'] );
+		$out['delivery']      = self::entry_delivery( (int) $row['form_id'], $row );
 
 		return $out;
 	}
