@@ -220,7 +220,14 @@ never `0`, which would read as "no attacks" rather than "not measured".
                                                    "event": "form_submission", "to_type": "email",
                                                    "to": "hello@example.com" } ],
                               "entries_total": 60, "entries_30d": 4, "entries_prev_30d": 3,
-                              "last_entry": "2026-08-31T01:34:44+00:00" } ] }
+                              "last_entry": "2026-08-31T01:34:44+00:00",
+                              // the site's own email log for this form (1.6.0)
+                              "notifications_30d": { "checked": true, "reason": null,
+                                                     "sent": 8, "failed": 1,
+                                                     "prev_30d": { "sent": 6, "failed": 0 },
+                                                     "last_sent_at": "2026-08-31T01:34:46+00:00",
+                                                     "last_failed_at": "2026-08-12T09:02:11+00:00",
+                                                     "last_error": "WordPress was unable to send the notification email." } } ] }
 }
 ```
 
@@ -266,6 +273,43 @@ rather than a misleading empty list.
 Compare `site.home` against the domain you asked about before trusting the numbers — that is what
 stops a staging box quietly answering for production. The support-plan skill's SSH connector does
 the same thing via `siteurl`, flagging `ENV MISMATCH`.
+
+## Notification log (added 1.6.0)
+
+Every form item carries `notifications_30d`: what Gravity Forms itself recorded about the
+notifications it tried to send for that form in the last 30 days. This is the site's own email log,
+and it answers the question the entry counts cannot — *are this form's real submissions being
+emailed?* — without submitting anything.
+
+Gravity Forms writes one entry note per notification attempt (`GFFormsModel::add_notification_note()`,
+GF ≥ 2.4.14): `sub_type` `success` when `wp_mail()` handed the message to the sending server, `error`
+with the underlying reason when it did not. The plugin counts those per form in one grouped query
+(joined to the entry table for the form id), with the 30 days before as a second window so a collapse
+is visible rather than just a zero, and returns the most recent error text per form because it usually
+*is* the diagnosis — an invalid TO address, an SMTP refusal. That text is GF's own system message,
+never visitor input, and is capped at 500 characters.
+
+| Field | Meaning |
+|---|---|
+| `checked` | `false` with a `reason` when the log could not be read (no notes table, or a pre-2.3 schema without `sub_type`). A zero that means "not measured" is exactly what this plugin refuses to emit. |
+| `sent` / `failed` | Notifications accepted by / refused by the sending server, last 30 days |
+| `prev_30d` | The same two counts for the 30 days before |
+| `last_sent_at` / `last_failed_at` | Most recent of each (UTC, ISO 8601) |
+| `last_error` | Text of the most recent failure in the window, or `null` |
+
+Two things to read correctly:
+
+- **Accepted is not delivered.** `success` means the sending server took the message. A bounce, a
+  full mailbox or a spam folder downstream are invisible here. It is still the difference between
+  "the form quietly mails nobody" and "the mail left the building", and it is what the fleet
+  agreed to treat as proof of sending.
+- **Entry status is not filtered.** A note exists only because a send was attempted, and a later
+  trash or spam flag on the entry does not un-send the mail — so `sent` can exceed `entries_30d`
+  on a site where test entries are trashed after the fact.
+
+This is what lets a captcha-gated form — one no unattended check can submit — still be reported
+on: `sent > 0, failed = 0` over 30 days is evidence from real people's submissions, `failed > 0`
+carries its own reason, and `0 / 0` honestly means there was nothing to judge by.
 
 ## Entry lookup (added 1.5.0)
 
