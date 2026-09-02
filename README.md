@@ -211,7 +211,14 @@ never `0`, which would read as "no attacks" rather than "not measured".
   "forms":     { "engine": "gravityforms", "engine_version": "2.10.0",
                  "recaptcha_v3_sitewide": true,
                  "mailer": { "plugin": "wp-mail-smtp", "active": true, "mailer": "sendgrid",
-                             "wp_env": "production", "reason": null },
+                             "wp_env": "production", "reason": null,
+                             // what SendGrid said about the last 30 days of this site's mail (1.7.0)
+                             "delivery_30d": { "webhook_configured": true, "checked": true, "reason": null,
+                                               "delivered": 41, "bounced": 1, "dropped": 0, "deferred": 2,
+                                               "last_event_at": "2026-09-02T04:01:16+00:00",
+                                               "last_bounce": { "to": "o***@example.com", "event": "bounce",
+                                                                "reason": "reason: 550 5.1.1 The email account that you tried to reach does not exist",
+                                                                "at": "2026-08-30T09:12:41+00:00" } } },
                  "count": 4,
                  "items": [ { "id": 1, "title": "Contact Form", "active": true,
                               // two independent gates, never collapsed into one flag
@@ -429,6 +436,70 @@ Two honest limits on top of that:
 
 Gravity Forms only, exactly like `forms`: any other form plugin returns `engine: null` and a reason
 rather than a misleading `found: false`.
+
+## Delivery events (added 1.7.0)
+
+The notification log says the site handed a message to its mail server. That is
+the ceiling of what a WordPress site can know on its own. One step further — did
+the **recipient's** mail server accept it — is something only the sending provider
+knows, and SendGrid tells anyone who asks through its Event Webhook. 1.7.0 collects
+those events per site and reads them back in two places.
+
+**Receiving:** `POST /wp-json/jb-health/v1/mail-events`. SendGrid posts batches of
+events here; the request is verified with SendGrid's *Signed Event Webhook* scheme
+(ECDSA P-256 / SHA-256 over `timestamp + body`) against the subuser's verification
+key, and nothing is parsed before that holds. Unsigned or badly signed → 401; a site
+with no key configured → 403, so a misdirected webhook shows up as errors in
+SendGrid's own activity feed instead of vanishing. Stored per event: recipient,
+event type, provider timestamp, the provider's reason. Never a subject, never a
+body. The table keeps seven days and is created on first use.
+
+**Setup, once per site (per SendGrid subuser):**
+
+1. SendGrid → Settings → Mail Settings → Event Webhook → HTTP POST URL
+   `https://<site>/wp-json/jb-health/v1/mail-events`. Tick at least *Delivered,
+   Bounced, Dropped, Deferred, Processed*. Enable *Signed Event Webhook* and copy
+   the **Verification Key**.
+2. Give the site that key as `JB_HEALTH_SENDGRID_PUBKEY` — the constant, the
+   environment (Bedrock `.env`, i.e. the `PROD_JB_HEALTH_SENDGRID_PUBKEY` repo
+   variable on the deploy pipeline), or the `jb_health_sendgrid_pubkey` option
+   (`wp option update …`). Checked in that order; empty means the feature is off
+   and every delivery answer says so.
+3. Send anything. `forms.mailer.delivery_30d` in `/report` turns from
+   `checked: false, reason: "no delivery events received yet"` into counts.
+
+**Reading, per entry:** `/forms/entry` gains `delivery`:
+
+```jsonc
+"delivery": { "configured": true, "checked": true, "reason": null,
+              "summary": "delivered",           // bounced · dropped · partial · deferred · processed · pending · unknown
+              "window": { "before_s": 0, "after_s": 1800, "from": "2026-09-02T04:01:13+00:00" },
+              "recipients": [ { "to": "hello@example.com", "status": "delivered",
+                                "events": [ { "event": "processed", "at": "…", "reason": null },
+                                            { "event": "delivered", "at": "…", "reason": "response: 250 2.0.0 OK" } ] } ] }
+```
+
+Events carry the recipient, not the entry, so the match is *an event for one of
+this form's active submission-notification recipients, from the moment Gravity
+Forms logged the send for this entry to thirty minutes after*. Recipients are
+resolved from the notification config with merge tags expanded (`{admin_email}`,
+a field the visitor typed); routing-type notifications are skipped, not guessed.
+**There is deliberately no look-back**: a delivery cannot precede its send, and any
+tolerance lets an earlier message to the same address stand in for this one — that
+exact false pass showed up in testing with two runs twelve seconds apart. Two
+submissions to the same recipient inside one half hour can still share an event;
+the form check submits once per form per run, so that is a documented corner.
+
+**Reading, site-wide:** `forms.mailer.delivery_30d` — delivered / bounced / dropped
+/ deferred counts for the last 30 days, the last event time, and the most recent
+bounce with a masked address (`j***@example.com`) and the provider's reason. The
+number that says "the client actually receives what this site sends", and the
+line that names a dead address.
+
+**What it proves, and what it does not.** `delivered` = the recipient's mail server
+took the message. A spam folder is on the far side of that and invisible to every
+tool that does not read the recipient's inbox. Bounces and drops, on the other
+hand, are exactly the failures the notification log cannot see, with the reason.
 
 ## A note on PHP version accuracy
 
