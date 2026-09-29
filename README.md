@@ -1,7 +1,8 @@
 # JB Site Health
 
-A **read-only** WordPress endpoint that supplies the six Digital Support Plan data points which
-cannot be observed from outside a site. One request, one signed token, no per-site configuration.
+A WordPress endpoint that supplies the six Digital Support Plan data points which cannot be
+observed from outside a site, and (from 1.8.0) the PHP errors the site has been throwing. One
+request, one signed token, no per-site configuration.
 
 > **This repository is public.** The fleet private key is deliberately **not** committed here, and
 > is not committed anywhere else either — it lives only in the caller's environment. Only the public
@@ -26,12 +27,15 @@ the "Needs access to check" block:
 
 jb-ops can answer some of this, but it carries 80+ operations including `write_file`, `export_db`,
 `update_option` and `activate_plugin`, with writes enabled. Shipping that to every client site
-purely to feed a monthly read-only report is far more privilege than the job needs.
+purely to feed a monthly report is far more privilege than the job needs.
 
-This plugin is **read-only by construction** — there is no code path that writes to the database,
-the filesystem, or the options table. It therefore carries its **own keypair**, deliberately
-separate from `jb-ops-access/`: if this fleet-wide key ever leaks, the worst case is information
-disclosure, not site takeover.
+This plugin **never changes the site**: no posts, users, settings, files or code. The only rows it
+writes are its own. That means the SendGrid delivery ledger (1.7.0, accepted only under SendGrid's
+signature), the PHP error log (1.8.0, recorded by the site as errors happen and pruned to its
+retention window when read), and one option recording the error tables' schema version. No caller
+chooses what is written. It therefore carries its **own keypair**, deliberately separate from
+`jb-ops-access/`: if this fleet-wide key ever leaks, the worst case is information disclosure, not
+site takeover.
 
 It also installs on the sites that have no jb-ops bridge at all, without granting them write access.
 
@@ -133,8 +137,8 @@ vault, and nothing to keep in sync.
 That is a deliberate trade rather than an oversight. A committed credential is in git history
 permanently and is readable by everyone with access to that repo — accepted because the alternative
 (a secret somebody has to set per environment) is exactly the configuration step that left this
-report showing `Unknown` on almost every site, and because this plugin is read-only, so the worst
-case is disclosure rather than takeover. **Rotating is the revocation** — deleting the constant is
+report showing `Unknown` on almost every site, and because nothing a token unlocks here can change
+the site, so the worst case is disclosure rather than takeover. **Rotating is the revocation** — deleting the constant is
 not. See [Rotating](#rotating).
 
 ### Rotating
@@ -156,6 +160,34 @@ single staging site at the time, so this went straight to the new key rather tha
 path above. The retired public key is gone from the list, so the old private key — which remains in
 the skills repo's git history and cannot be removed from it — now verifies against nothing. Any site
 still on `1.1.0` will reject current tokens until it redeploys.
+
+### Loop's per-request token (jb2, added 1.8.0)
+
+Loop calls with its own token, signed per request instead of per day:
+
+```
+jb2.<base64url claims JSON>.<base64url Ed25519 signature of "jb-health-v2:" + claims segment>
+```
+
+The signature is checked before the claims are decoded. The claims must then say `v: 2`,
+`iss: "loop"`, carry integer `iat`/`exp` at most 300 seconds apart (60 seconds of clock skew either
+way), a `jti` of 16 to 64 URL-safe characters, and an `aud` naming this site. The audience is
+compared against the hosts of both `home_url()` and `site_url()`, lowercased, without port, one
+trailing dot or one leading `www.`, and never against the request's `Host` header.
+
+Each token is scoped per route, so a token minted to read errors cannot read form entries:
+
+| Route | Scope |
+|---|---|
+| `/report` | `report:read` |
+| `/errors` | `errors:read` |
+| `/forms/entry` | `forms:read` |
+
+Loop's public keys live in `JB_HEALTH_LOOP_PUBKEYS`, a list for rotation exactly like
+`JB_HEALTH_SIGNING_PUBKEYS`. It ships empty: no jb2 token verifies until Loop's production key is
+added at release. jb1 is unchanged and keeps working on every route. Failures get the same generic
+`401 Unauthorised` either way. Send the token in both `Authorization: Bearer` and
+`X-JB-Health-Token`, with a browser-like `User-Agent`.
 
 ## The one rule: never guess
 
@@ -234,7 +266,11 @@ never `0`, which would read as "no attacks" rather than "not measured".
                                                      "prev_30d": { "sent": 6, "failed": 0 },
                                                      "last_sent_at": "2026-08-31T01:34:46+00:00",
                                                      "last_failed_at": "2026-08-12T09:02:11+00:00",
-                                                     "last_error": "WordPress was unable to send the notification email." } } ] }
+                                                     "last_error": "WordPress was unable to send the notification email." } } ] },
+  // the site's own PHP error log (1.8.0); nulls + reason when capture is off
+  "errors":    { "capture_enabled": true, "reason": null, "fatal_30d": 2, "warning_30d": 311,
+                 "groups_active_24h": 4, "last_fatal_at": "2026-09-26T22:14:03Z",
+                 "top": [ /* up to five groups, fatals first, same shape as /errors minus `days` */ ] }
 }
 ```
 
@@ -501,6 +537,92 @@ took the message. A spam folder is on the far side of that and invisible to ever
 tool that does not read the recipient's inbox. Bounces and drops, on the other
 hand, are exactly the failures the notification log cannot see, with the reason.
 
+## PHP errors (added 1.8.0)
+
+A site can look fine from the outside while a plugin throws a warning on every page or a checkout
+step fatals for one customer in ten. 1.8.0 records what PHP itself reports, on the site, and hands
+it to Loop.
+
+**What is recorded.** Every fatal (including uncaught exceptions and out-of-memory), plus warnings
+by default. Each error becomes a group, keyed by a fingerprint of level, type, relative file, line
+and the message's first line with numbers and quoted values blanked. So `Undefined array key "a"`
+and `…"b"` from the same line are one group, with a running `count`, a `first_seen`/`last_seen`,
+the request type it last came from (`web`, `admin`, `ajax`, `rest`, `cron` or `cli`), the path it
+last happened on, and the component that owns the file (`plugin:<slug>`, `mu-plugin:<name>`,
+`theme:<slug>`, `core`, `dropin:<file>`, `vendor:<vendor/pkg>` or `other`). Daily counts per group
+sit beside it.
+
+**What it costs a request.** The handler only buffers. A repeat of the same error costs an array
+lookup, so a warning fired 10,000 times in one loop is one row with `count: 10000`, written at the
+end of the request in two statements. At most 25 distinct errors are itemised per request; the rest
+are counted in one overflow group per level. `@`-suppressed errors are skipped. Nothing is written
+while WordPress installs or upgrades, while it sandboxes a plugin activation, or when the fatal is
+the database or object cache itself. A write that fails is dropped, never retried.
+
+**What never leaves the site.** Messages and paths are redacted before they are stored. Absolute
+paths become relative to the site (or `…/basename`), stack traces keep five frames and lose their
+arguments (that is where a password passed to a login function would show up), and query strings,
+emails (masked as `j***@example.com`), `'user'@'host'` pairs, `password=`/`token=`/`key=`-style
+values, long hex or base64 tokens and IP addresses are replaced. Messages are capped at 1,000
+characters.
+
+**Reading it.** `GET /wp-json/jb-health/v1/errors`, same auth as `/report`:
+
+| Parameter | Meaning |
+|---|---|
+| `since` | ISO 8601 or unix seconds. Default: the last 24 hours |
+| `limit` | 1 to 500, default 100. `truncated: true` when more matched |
+| `level` | Optional: `fatal`, `warning`, `notice` or `deprecated` |
+
+```jsonc
+{ "ok": true, "schema_version": 1, "plugin_version": "1.8.0", "generated_at": "2026-09-27T03:00:00Z",
+  "site": { "home": "…", "siteurl": "…" },
+  "capture": { "enabled": true, "levels": ["fatal", "warning"], "reason": null },
+  "window": { "since": "2026-09-26T03:00:00Z", "until": "2026-09-27T03:00:00Z" },
+  "truncated": false,
+  "groups": [ { "fingerprint": "…40 hex…", "level": "warning", "type": "E_WARNING",
+                "message": "Undefined array key \"proofs\"",
+                "file": "app/plugins/wp-real-time-social-proof/wprtsp.php", "line": 770,
+                "component": "plugin:wp-real-time-social-proof", "context": "web", "last_path": "/",
+                "first_seen": "…Z", "last_seen": "…Z", "count": 123,
+                "days": [ ["2026-09-26", 14], ["2026-09-27", 3] ] } ],
+  "daily": [ { "day": "2026-08-29", "fatal": 0, "warning": 3 } /* 30 rows, oldest first, zero-filled */ ] }
+```
+
+`days` covers the query window (from the `since` date). `daily` is always 30 rows, site-wide, with
+`notice`/`deprecated` keys only when those levels are recorded. A malformed `since` from a caller
+without a valid token gets the usual 401, not a 400. `/report` carries a summary of the same data as
+`errors`.
+
+**Settings**, all optional, in `wp-config.php`:
+
+| Constant | Default | Effect |
+|---|---|---|
+| `JB_HEALTH_CAPTURE_ERRORS` | on | `false` switches capture off. `/errors` then answers `capture.enabled: false` with a reason |
+| `JB_HEALTH_ERROR_LEVELS` | `E_WARNING \| E_USER_WARNING` | Which non-fatal levels are recorded. Fatals always are. On PHP 8 deprecations run to hundreds per request, which is why they are off by default |
+| `JB_HEALTH_LOOP_PUBKEYS` | empty | Loop's jb2 public keys (see [Auth](#loops-per-request-token-jb2-added-180)) |
+
+**Storage and retention.** Two tables, `{prefix}jb_health_errors` and `{prefix}jb_health_error_days`,
+created on `plugins_loaded` when the recorded `jb_health_db_version` option is behind the plugin
+(so an in-place deploy needs no activation step). A failed create is retried hourly, not on every
+page. If the tables vanish (a database pulled from another environment), the next write or read
+notices and they are rebuilt on the following request. Whenever the log is read, day rows older than
+35 days and groups unseen for 30 days are removed, and only the 500 most recently seen groups are
+kept. There is no cron to depend on.
+
+**Honest limits.**
+
+- Query Monitor replaces the error handler and never passes errors on. The plugin takes the top
+  spot back at the end of `plugins_loaded`, with Query Monitor chained behind it. A handler that
+  displaces it later than that (on `init`, say) hides errors raised after that point.
+- WordPress's fatal error page runs before any plugin's shutdown code and ends the request, so the
+  fatal is recorded from the `wp_php_error_message` filter. A site with a custom
+  `wp-content/php-error.php` drop-in that exits skips that filter, and its fatals are not recorded.
+- An `E_USER_ERROR` that another handler swallows never becomes a fatal, so it is not recorded.
+- An out-of-memory fatal is recorded from a 32 KB reserve released at shutdown. It worked in testing
+  (64 MB limit, 20 KB allocation), but a request that dies deep inside WordPress's own fatal handler
+  can still take the recording down with it.
+
 ## A note on PHP version accuracy
 
 This reports the PHP the **site actually runs on**, because it executes inside WordPress. The SSH
@@ -519,3 +641,14 @@ Deployed to `termihc.com.au` staging on 28 Jul 2026. The support-plan report res
 `Unknown` rows: WordPress 7.0.2, PHP 8.3.24 (`fpm-fcgi`), `DISALLOW_FILE_EDIT=1`, brute-force 0 via
 Solid Security — and the "Needs access to check" block dropped from 6 entries to 3, all of which are
 uptime figures Loop already sources from Better Stack.
+
+1.8.0 was tested against `globalin25.test` (Bedrock, WordPress 7.1, PHP 8.4 web / 8.2 CLI, MySQL
+9.4) on 27 Sep 2026 with the jb2 test vector key. Warnings and fatals were recorded from page views,
+the REST API, wp-admin, admin-ajax, wp-cron and WP-CLI, each with the right context. A loop of
+10,000 warnings produced one row with `count: 10000` and no measurable slowdown. Suppressed errors
+produced nothing. Uncaught exceptions, out-of-memory and post-output fatals were all recorded, and
+WordPress's error page still answered 500. Stored rows held no absolute paths, emails, IPs, query
+strings or stack-frame arguments. jb2 answered 200 for a valid token (including a `www.` audience)
+and 401 for expired, over-long, wrong-audience, wrong-context, wrong-key, tampered and
+under-scoped tokens. jb1 was unchanged. Query Monitor was not active on that site, so its
+displacement was simulated with a non-chaining handler rather than tested with Query Monitor itself.
