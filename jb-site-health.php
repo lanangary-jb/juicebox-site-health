@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: JB Site Health
- * Description: Read-only site-health endpoint for the Juicebox Digital Support Plan report. Returns the data points that cannot be observed from outside the site — WordPress/PHP version, plugin update status, hardening flags, and brute-force counts.
- * Version:     1.7.0
+ * Description: Site-health endpoint for the Juicebox Digital Support Plan report. Returns the data points that cannot be observed from outside the site — WordPress/PHP version, plugin update status, hardening flags, brute-force counts, and the PHP errors the site has been throwing.
+ * Version:     1.8.0
  * Author:      Juicebox Creative
  * License:     Proprietary — internal Juicebox use only
  *
@@ -24,12 +24,16 @@
  * ---------------------------------------------------------------------------
  * jb-ops can already answer some of this, but it carries 80+ operations
  * including write_file / export_db / update_option / activate_plugin. Shipping
- * that to every client site purely to feed a monthly read-only report is far
- * more privilege than the job needs. This plugin is READ-ONLY BY CONSTRUCTION:
- * there is no code path here that writes to the database, the filesystem, or
- * the options table. If its key leaks the worst case is information
- * disclosure, not site takeover — so it carries its OWN keypair, deliberately
- * separate from the jb-ops fleet key.
+ * that to every client site purely to feed a monthly report is far more
+ * privilege than the job needs. This plugin never touches the site itself:
+ * no posts, users, settings, files or code. The only rows it writes are its
+ * OWN — the SendGrid delivery ledger (1.7.0, accepted only under SendGrid's
+ * signature), the PHP error log (1.8.0, recorded by the site as errors
+ * happen and pruned to its retention window when read), and the one option
+ * that records those error tables' schema. No caller chooses what is
+ * written. If its key leaks the worst case is information disclosure, not
+ * site takeover — so it carries its OWN keypair, deliberately separate from
+ * the jb-ops fleet key.
  *
  * ---------------------------------------------------------------------------
  * INSTALLATION — two options, no per-site configuration either way
@@ -88,19 +92,80 @@ if ( ! defined( 'JB_HEALTH_SIGNING_PUBKEYS' ) ) {
 		)
 	);
 }
+
+/**
+ * Loop's signing public keys for the per-request `jb2` token (1.8.0).
+ *
+ * A separate list from JB_HEALTH_SIGNING_PUBKEYS because it is a separate
+ * signer: Loop mints a short-lived, audience-bound, scoped token per request,
+ * where the jb1 key signs a whole day for every site. Same rotation rule —
+ * add the incoming key, deploy, switch the signer, drop the old one. Empty
+ * means no jb2 token verifies; jb1 is unaffected.
+ */
+if ( ! defined( 'JB_HEALTH_LOOP_PUBKEYS' ) ) {
+	define( 'JB_HEALTH_LOOP_PUBKEYS', array() );
+}
+
+/**
+ * Which non-fatal PHP errors are recorded (1.8.0). Fatals always are.
+ * Warnings by default: on PHP 8 a busy plugin raises hundreds of deprecations
+ * per request, and a log that is mostly noise stops being read. Define
+ * JB_HEALTH_CAPTURE_ERRORS as false in wp-config.php to switch capture off.
+ */
+if ( ! defined( 'JB_HEALTH_ERROR_LEVELS' ) ) {
+	define( 'JB_HEALTH_ERROR_LEVELS', E_WARNING | E_USER_WARNING );
+}
 define( 'JB_HEALTH_SIGN_CONTEXT', 'jb-health-v1:' );
-define( 'JB_HEALTH_VERSION', '1.7.0' );
+define( 'JB_HEALTH_V2_CONTEXT', 'jb-health-v2:' );
+define( 'JB_HEALTH_VERSION', '1.8.0' );
 define( 'JB_HEALTH_SCHEMA', 1 );
 
 /**
- * Read-only site-health reporter.
+ * Site-health reporter and PHP error recorder.
  */
 final class JB_Site_Health {
 
-	/** Wire up the REST routes, and the 401-before-400 guard they depend on. */
+	/** Error types that end the request. They never reach a user error handler. */
+	const FATAL_TYPES = E_ERROR | E_PARSE | E_CORE_ERROR | E_COMPILE_ERROR | E_USER_ERROR | E_RECOVERABLE_ERROR;
+
+	/** Non-fatal types a user error handler can see, and therefore the most JB_HEALTH_ERROR_LEVELS can ask for. */
+	const CAPTURABLE_TYPES = E_WARNING | E_NOTICE | E_USER_WARNING | E_USER_NOTICE | E_DEPRECATED | E_USER_DEPRECATED;
+
+	/** Distinct errors itemised per request; the rest are counted in one overflow group per level. */
+	const MAX_DISTINCT_ERRORS = 25;
+
+	/** @var string|null Held back so an out-of-memory fatal still has room to be recorded. */
+	private static $reserve = null;
+
+	/** @var callable|null Whatever error handler was active before ours. */
+	private static $previous_handler = null;
+
+	/** @var bool Set while we are inside our own handler or writing, so nothing re-enters. */
+	private static $busy = false;
+
+	/** @var bool The request's fatal has been recorded (by the wp_php_error_message filter or at shutdown). */
+	private static $fatal_done = false;
+
+	/** @var int JB_HEALTH_ERROR_LEVELS, masked to what a handler can see. */
+	private static $levels = 0;
+
+	/** @var array Errors seen this request, keyed errno|file|line|md5(message). */
+	private static $buffer = array();
+
+	/** @var int Distinct non-fatal errors itemised so far this request. */
+	private static $distinct = 0;
+
+	/** @var array|null Normalised roots for relative paths and components, built on first use. */
+	private static $roots = null;
+
+	/** @var int Theme-root count the cached roots were built with. */
+	private static $roots_key = -1;
+
+	/** Wire up the REST routes, the 401-before-400 guard they depend on, and error capture. */
 	public static function init() {
 		add_action( 'rest_api_init', array( __CLASS__, 'register_routes' ) );
 		add_filter( 'rest_request_before_callbacks', array( __CLASS__, 'shield_unauthorised' ), 10, 3 );
+		self::boot_capture();
 	}
 
 	/** Register GET /wp-json/jb-health/v1/report and /wp-json/jb-health/v1/forms/entry. */
@@ -118,6 +183,34 @@ final class JB_Site_Health {
 					'refresh' => array(
 						'default'           => false,
 						'sanitize_callback' => 'rest_sanitize_boolean',
+					),
+				),
+			)
+		);
+
+		/**
+		 * PHP errors recorded on this site (added 1.8.0). Same permission
+		 * callback, so shield_unauthorised() keeps a malformed `since` from a
+		 * stranger at 401 rather than a descriptive 400.
+		 */
+		register_rest_route(
+			'jb-health/v1',
+			'/errors',
+			array(
+				'methods'             => 'GET',
+				'callback'            => array( __CLASS__, 'handle_errors' ),
+				'permission_callback' => array( __CLASS__, 'authorise' ),
+				'args'                => array(
+					'since' => array(
+						'validate_callback' => array( __CLASS__, 'validate_since' ),
+					),
+					'limit' => array(
+						'default'           => 100,
+						'validate_callback' => array( __CLASS__, 'validate_limit' ),
+						'sanitize_callback' => 'absint',
+					),
+					'level' => array(
+						'validate_callback' => array( __CLASS__, 'validate_level' ),
 					),
 				),
 			)
@@ -187,7 +280,8 @@ final class JB_Site_Health {
 	// ----------------------------------------------------------------- //
 
 	/**
-	 * Accept only a valid fleet-signed token.
+	 * Accept only a valid fleet-signed jb1 token, or a Loop-signed jb2 token
+	 * carrying the scope this route needs (1.8.0).
 	 *
 	 * Read the token from Authorization: Bearer, falling back to X-JB-Health-Token
 	 * because some hosts (LiteSpeed/cPanel in particular) strip Authorization
@@ -210,6 +304,10 @@ final class JB_Site_Health {
 		}
 
 		if ( '' !== $token && self::verify_signed_token( $token ) ) {
+			return true;
+		}
+
+		if ( '' !== $token && self::verify_jb2( $token, JB_HEALTH_V2_CONTEXT, self::loop_pubkeys(), 300, self::jb2_scope( $request ) ) ) {
 			return true;
 		}
 
@@ -346,6 +444,134 @@ final class JB_Site_Health {
 		return base64_decode( $s, true );
 	}
 
+	/**
+	 * Verify a Loop-signed token: jb2.<claims b64url>.<Ed25519 signature b64url>.
+	 *
+	 * The signature covers $context immediately followed by the claims segment
+	 * exactly as sent, and it is checked BEFORE the claims are decoded, so
+	 * nothing an unsigned caller sends ever reaches json_decode(). The audience
+	 * must name this site by home_url() or site_url() — never the Host header,
+	 * which is whatever the caller says it is. jti is shape-checked only: with
+	 * a five-minute ceiling on lifetime, storing it would cost a write per read
+	 * for very little.
+	 *
+	 * Self-contained apart from jb2_host(), so it can be lifted into another
+	 * single-file plugin unchanged. Returns false rather than throwing.
+	 *
+	 * @param string   $token          Candidate token.
+	 * @param string   $context        Signing context, e.g. "jb-health-v2:".
+	 * @param string[] $keys           Base64 Ed25519 public keys; any one may sign.
+	 * @param int      $max_ttl        Longest exp - iat accepted, in seconds.
+	 * @param string   $required_scope Scope the route needs; empty never verifies.
+	 * @return bool
+	 */
+	private static function verify_jb2( $token, $context, $keys, $max_ttl, $required_scope ) {
+		$skew = 60;
+
+		if ( '' === (string) $required_scope || ! function_exists( 'sodium_crypto_sign_verify_detached' ) ) {
+			return false;
+		}
+		if ( ! is_string( $token ) || strlen( $token ) > 4096 || ! preg_match( '/^jb2\.([A-Za-z0-9_-]{16,3000})\.([A-Za-z0-9_-]{86})$/D', $token, $m ) ) {
+			return false;
+		}
+
+		$sig = base64_decode( strtr( $m[2], '-_', '+/' ) . '==', true );
+		if ( false === $sig || SODIUM_CRYPTO_SIGN_BYTES !== strlen( $sig ) ) {
+			return false;
+		}
+
+		// Any key in the list may sign, so a rotation can overlap; a malformed
+		// entry is skipped rather than allowed to shadow a good one.
+		$signed = false;
+		foreach ( (array) $keys as $pub_b64 ) {
+			$pk = base64_decode( (string) $pub_b64, true );
+			if ( false !== $pk && SODIUM_CRYPTO_SIGN_PUBLICKEYBYTES === strlen( $pk ) && sodium_crypto_sign_verify_detached( $sig, $context . $m[1], $pk ) ) {
+				$signed = true;
+				break;
+			}
+		}
+		if ( ! $signed ) {
+			return false;
+		}
+
+		$b64    = strtr( $m[1], '-_', '+/' );
+		$json   = base64_decode( $b64 . str_repeat( '=', ( 4 - strlen( $b64 ) % 4 ) % 4 ), true );
+		$claims = false === $json ? null : json_decode( $json, true );
+		if ( ! is_array( $claims ) ) {
+			return false;
+		}
+
+		$now = time();
+		$iat = isset( $claims['iat'] ) ? $claims['iat'] : null;
+		$exp = isset( $claims['exp'] ) ? $claims['exp'] : null;
+
+		if ( ! isset( $claims['v'], $claims['iss'] ) || 2 !== $claims['v'] || 'loop' !== $claims['iss'] ) {
+			return false;
+		}
+		if ( ! is_int( $iat ) || ! is_int( $exp ) || $exp - $iat < 1 || $exp - $iat > $max_ttl || $now > $exp + $skew || $iat > $now + $skew ) {
+			return false;
+		}
+		if ( ! isset( $claims['jti'] ) || ! is_string( $claims['jti'] ) || ! preg_match( '/^[A-Za-z0-9_-]{16,64}$/D', $claims['jti'] ) ) {
+			return false;
+		}
+		if ( ! isset( $claims['scope'] ) || ! is_string( $claims['scope'] ) || ! in_array( (string) $required_scope, explode( ' ', $claims['scope'] ), true ) ) {
+			return false;
+		}
+
+		$aud   = isset( $claims['aud'] ) && is_string( $claims['aud'] ) ? self::jb2_host( $claims['aud'] ) : '';
+		$hosts = array_filter( array( self::jb2_host( home_url() ), self::jb2_host( site_url() ) ) );
+
+		return '' !== $aud && in_array( $aud, $hosts, true );
+	}
+
+	/**
+	 * A host as jb2 audiences compare it, on both sides: lowercase, no scheme,
+	 * port or path, one trailing dot and one leading "www." removed.
+	 *
+	 * @param string $value URL or bare host.
+	 * @return string '' when no host can be read.
+	 */
+	private static function jb2_host( $value ) {
+		$value = strtolower( trim( (string) $value ) );
+		if ( '' === $value ) {
+			return '';
+		}
+		$host = wp_parse_url( false === strpos( $value, '://' ) ? 'http://' . $value : $value, PHP_URL_HOST );
+		$host = is_string( $host ) ? $host : '';
+		if ( '.' === substr( $host, -1 ) ) {
+			$host = substr( $host, 0, -1 );
+		}
+		if ( 0 === strpos( $host, 'www.' ) ) {
+			$host = substr( $host, 4 );
+		}
+		return $host;
+	}
+
+	/**
+	 * The scope a jb2 token needs for the route being requested.
+	 *
+	 * An unmapped route gets '' and so no jb2 token at all: a new route has to
+	 * be given a scope here before Loop can call it. Lowercased because REST
+	 * route matching is case-insensitive.
+	 *
+	 * @param WP_REST_Request $request The request.
+	 * @return string
+	 */
+	private static function jb2_scope( $request ) {
+		$map   = array(
+			'/jb-health/v1/report'      => 'report:read',
+			'/jb-health/v1/errors'      => 'errors:read',
+			'/jb-health/v1/forms/entry' => 'forms:read',
+		);
+		$route = strtolower( untrailingslashit( (string) $request->get_route() ) );
+		return isset( $map[ $route ] ) ? $map[ $route ] : '';
+	}
+
+	/** Loop's public keys, as a list of base64 strings. */
+	private static function loop_pubkeys() {
+		return defined( 'JB_HEALTH_LOOP_PUBKEYS' ) ? array_filter( array_map( 'strval', (array) JB_HEALTH_LOOP_PUBKEYS ) ) : array();
+	}
+
 	// ----------------------------------------------------------------- //
 	// Report
 	// ----------------------------------------------------------------- //
@@ -372,6 +598,7 @@ final class JB_Site_Health {
 			'hardening'      => self::hardening_info(),
 			'brute_force'    => self::brute_force_info(),
 			'forms'          => self::forms_info(),
+			'errors'         => self::errors_summary(),
 		);
 
 		$response = new WP_REST_Response( $payload, 200 );
@@ -904,14 +1131,27 @@ final class JB_Site_Health {
 	 *
 	 * Absolute server paths are connector infrastructure — the report pipeline
 	 * strips them, and they mean nothing to a client. When the path is not under
-	 * the root, only the basename survives.
+	 * the root, only the basename survives, after $unknown_prefix.
+	 *
+	 * $root may also be a map of root => label, longest first (the error log's
+	 * roots, 1.8.0): the first root containing the path wins, and its label
+	 * replaces it ('' for none).
+	 *
+	 * @param string       $path           Absolute path.
+	 * @param string|array $root           Root directory, or root => label map.
+	 * @param string       $unknown_prefix Put in front of a bare basename.
+	 * @return string
 	 */
-	private static function relative_to( $path, $root ) {
+	private static function relative_to( $path, $root, $unknown_prefix = '' ) {
 		$path = (string) $path;
-		if ( $root && 0 === strpos( $path, $root . '/' ) ) {
-			return substr( $path, strlen( $root ) + 1 );
+		foreach ( is_array( $root ) ? $root : array( (string) $root => '' ) as $dir => $label ) {
+			$dir = (string) $dir;
+			if ( '' !== $dir && 0 === strpos( $path, $dir . '/' ) ) {
+				$rest = substr( $path, strlen( $dir ) + 1 );
+				return '' === $label ? $rest : $label . '/' . $rest;
+			}
 		}
-		return basename( $path );
+		return $unknown_prefix . basename( $path );
 	}
 
 	/**
@@ -1978,6 +2218,1206 @@ final class JB_Site_Health {
 			return $email;
 		}
 		return substr( $email, 0, 1 ) . '***' . substr( $email, $at );
+	}
+
+	// ----------------------------------------------------------------- //
+	// PHP errors — added 1.8.0
+	// ----------------------------------------------------------------- //
+
+	/**
+	 * Start recording PHP errors. Runs at file load rather than on a hook, so
+	 * errors raised while the other plugins load are caught as well.
+	 *
+	 * The handler only buffers, and the request's errors are written in two
+	 * statements at the very end: a warning inside a loop can fire thousands
+	 * of times in one request, and each repeat costs an array lookup.
+	 *
+	 * Fatals never reach an error handler, so they are read at shutdown — and
+	 * from wp_php_error_message too, because WordPress registers its own fatal
+	 * handler before any plugin loads, so it runs first, and its error page
+	 * ends in wp_die(), which stops every shutdown function after it.
+	 */
+	private static function boot_capture() {
+		if ( ! self::capture_enabled() ) {
+			return;
+		}
+		self::$levels           = (int) JB_HEALTH_ERROR_LEVELS & self::CAPTURABLE_TYPES;
+		self::$reserve          = str_repeat( 'x', 32768 );
+		self::$previous_handler = set_error_handler( array( __CLASS__, 'on_php_error' ) );
+		register_shutdown_function( array( __CLASS__, 'on_shutdown' ) );
+		add_filter( 'wp_php_error_message', array( __CLASS__, 'on_wp_fatal' ), 0, 2 );
+		add_action( 'plugins_loaded', array( __CLASS__, 'maybe_upgrade' ), 1 );
+		add_action( 'plugins_loaded', array( __CLASS__, 'reclaim_error_handler' ), PHP_INT_MAX );
+	}
+
+	/** Capture is on unless wp-config.php defines JB_HEALTH_CAPTURE_ERRORS as false. */
+	private static function capture_enabled() {
+		return ! ( defined( 'JB_HEALTH_CAPTURE_ERRORS' ) && false === JB_HEALTH_CAPTURE_ERRORS );
+	}
+
+	/**
+	 * The error handler. Registered with no level mask, so it sees every
+	 * non-fatal error, and it hands each one on to the handler it displaced
+	 * and returns that handler's answer: the site behaves exactly as it did
+	 * before, whether or not anything was recorded.
+	 *
+	 * @-suppressed errors are skipped (error_reporting() drops the level while
+	 * @ is in effect) — their author has already said they are expected.
+	 *
+	 * @param int    $no   Error level.
+	 * @param string $str  Message.
+	 * @param string $file File the error was raised in.
+	 * @param int    $line Line.
+	 * @return bool
+	 */
+	public static function on_php_error( $no, $str, $file = '', $line = 0 ) {
+		if ( self::$busy ) {
+			return false;
+		}
+		self::$busy = true;
+		try {
+			if ( ( $no & self::$levels ) && ( error_reporting() & $no ) ) {
+				self::buffer_error( $no, $str, $file, $line );
+			}
+		} catch ( Throwable $e ) {
+			// Recording an error must never become one.
+			unset( $e );
+		}
+
+		if ( ! self::$previous_handler ) {
+			self::$busy = false;
+			return false;
+		}
+
+		// $busy stays set while the previous handler runs, so one that chains
+		// back here gets false instead of a loop. The arguments go on exactly
+		// as received: PHP 7 passes a fifth ($errcontext) that an old handler
+		// may still declare as required.
+		try {
+			return call_user_func_array( self::$previous_handler, func_get_args() );
+		} finally {
+			self::$busy = false;
+		}
+	}
+
+	/**
+	 * Put our handler back on top if something displaced it while the plugins
+	 * loaded. Query Monitor does exactly that and never chains, so without
+	 * this nothing raised after QM loads would reach us. The displacer becomes
+	 * our previous handler, so it still sees every error it saw before.
+	 */
+	public static function reclaim_error_handler() {
+		$ours    = array( __CLASS__, 'on_php_error' );
+		$current = set_error_handler( $ours );
+		if ( $ours === $current ) {
+			restore_error_handler();
+			return;
+		}
+		self::$previous_handler = $current;
+	}
+
+	/**
+	 * wp_php_error_message filter: record the fatal and write, before WordPress's
+	 * error page calls wp_die(). Returns the message untouched.
+	 *
+	 * @param string $message Error page message.
+	 * @param array  $error   error_get_last() as WordPress read it.
+	 * @return string
+	 */
+	public static function on_wp_fatal( $message, $error = array() ) {
+		self::$reserve = null;
+		try {
+			self::record_fatal( $error );
+			self::flush_errors();
+		} catch ( Throwable $e ) {
+			// Never let recording get in the way of the error page.
+			unset( $e );
+		}
+		return $message;
+	}
+
+	/** Shutdown: record a fatal WordPress's handler did not pass us, then write. */
+	public static function on_shutdown() {
+		self::$reserve = null;
+		try {
+			self::record_fatal( error_get_last() );
+			self::flush_errors();
+		} catch ( Throwable $e ) {
+			// The request is over; there is nobody left to tell.
+			unset( $e );
+		}
+	}
+
+	/**
+	 * Buffer the request's fatal, once. Uncaught exceptions arrive here too,
+	 * as E_ERROR "Uncaught …".
+	 *
+	 * @param mixed $error error_get_last() shape, or anything else.
+	 */
+	private static function record_fatal( $error ) {
+		if ( self::$fatal_done || ! is_array( $error ) || empty( $error['type'] ) || ! ( (int) $error['type'] & self::FATAL_TYPES ) ) {
+			return;
+		}
+		self::$fatal_done = true;
+		self::$busy       = true;
+		try {
+			self::buffer_error(
+				(int) $error['type'],
+				isset( $error['message'] ) ? $error['message'] : '',
+				isset( $error['file'] ) ? $error['file'] : '',
+				isset( $error['line'] ) ? $error['line'] : 0
+			);
+		} finally {
+			self::$busy = false;
+		}
+	}
+
+	/**
+	 * Add one error to the request's buffer.
+	 *
+	 * A repeat of the same error at the same place only bumps a counter. The
+	 * expensive part — relative path, component, redaction, fingerprint —
+	 * happens on first sighting, for at most MAX_DISTINCT_ERRORS errors;
+	 * beyond that they are counted in one overflow group per level, so a
+	 * runaway request cannot fill the table and daily counts stay honest per
+	 * level. The fatal is always itemised.
+	 *
+	 * @param int    $no   Error level.
+	 * @param string $str  Message.
+	 * @param string $file File.
+	 * @param int    $line Line.
+	 */
+	private static function buffer_error( $no, $str, $file, $line ) {
+		$key = $no . '|' . $file . '|' . $line . '|' . md5( (string) $str );
+		if ( isset( self::$buffer[ $key ] ) ) {
+			++self::$buffer[ $key ]['count'];
+			return;
+		}
+
+		$level = self::error_level( $no );
+		$fatal = 'fatal' === $level;
+
+		if ( ! $fatal && self::$distinct >= self::MAX_DISTINCT_ERRORS ) {
+			$key = 'overflow|' . $level;
+			if ( ! isset( self::$buffer[ $key ] ) ) {
+				$types                = array(
+					'warning'    => E_WARNING,
+					'notice'     => E_NOTICE,
+					'deprecated' => E_DEPRECATED,
+				);
+				self::$buffer[ $key ] = array(
+					'fingerprint' => sha1( 'jb-health|overflow|' . $level ),
+					'level'       => $level,
+					'type'        => $types[ $level ],
+					'message'     => 'More than ' . self::MAX_DISTINCT_ERRORS . ' distinct PHP errors in one request; the rest are counted here, not itemised',
+					'file'        => '',
+					'line'        => 0,
+					'component'   => 'other',
+					'count'       => 0,
+				);
+			}
+			++self::$buffer[ $key ]['count'];
+			return;
+		}
+		if ( ! $fatal ) {
+			++self::$distinct;
+		}
+
+		$origin  = self::error_origin( $file );
+		$message = self::clip( self::redact_error_text( $str ), 1000 );
+		$type    = self::error_type_name( $no );
+
+		self::$buffer[ $key ] = array(
+			'fingerprint' => sha1( $level . '|' . $type . '|' . $origin['file'] . '|' . (int) $line . '|' . self::normalise_error_message( $message ) ),
+			'level'       => $level,
+			'type'        => (int) $no,
+			'message'     => $message,
+			'file'        => self::clip( $origin['file'], 255 ),
+			'line'        => (int) $line,
+			'component'   => self::clip( $origin['component'], 191 ),
+			'count'       => 1,
+		);
+	}
+
+	/**
+	 * Write the buffer: one multi-row upsert for the groups, one for the daily
+	 * counts. No retries, and errors suppressed — a health recorder that makes
+	 * a failing request fail harder is worse than one that misses a row.
+	 */
+	private static function flush_errors() {
+		global $wpdb;
+
+		if ( empty( self::$buffer ) ) {
+			return;
+		}
+		$buffer         = self::$buffer;
+		self::$buffer   = array();
+		self::$distinct = 0;
+
+		if ( ! self::can_write_errors( $buffer ) ) {
+			return;
+		}
+
+		$groups = array();
+		foreach ( $buffer as $row ) {
+			if ( $row['count'] < 1 ) {
+				continue;
+			}
+			if ( isset( $groups[ $row['fingerprint'] ] ) ) {
+				$groups[ $row['fingerprint'] ]['count'] += $row['count'];
+				continue;
+			}
+			$groups[ $row['fingerprint'] ] = $row;
+		}
+		if ( empty( $groups ) ) {
+			return;
+		}
+
+		$now      = gmdate( 'Y-m-d H:i:s' );
+		$day      = gmdate( 'Y-m-d' );
+		$context  = self::error_context();
+		$path     = self::error_request_path();
+		$errors   = self::error_table();
+		$days     = self::error_days_table();
+		$rows     = array();
+		$args     = array();
+		$day_rows = array();
+		$day_args = array();
+
+		foreach ( $groups as $g ) {
+			$rows[] = '(%s, %s, %d, %s, %s, %d, %s, %s, %s, %s, %s, %d)';
+			array_push( $args, $g['fingerprint'], $g['level'], $g['type'], $g['message'], $g['file'], $g['line'], $g['component'], $context, $path, $now, $now, $g['count'] );
+			$day_rows[] = '(%s, %s, %d)';
+			array_push( $day_args, $g['fingerprint'], $day, $g['count'] );
+		}
+
+		self::$busy = true;
+		$suppress   = $wpdb->suppress_errors( true );
+		try {
+			// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare -- table names cannot be bound; placeholders are built per row.
+			$ok = $wpdb->query(
+				$wpdb->prepare(
+					"INSERT INTO `{$errors}` (fingerprint, level, type, message, file, line, component, context, last_path, first_seen, last_seen, `count`) VALUES "
+					. implode( ', ', $rows )
+					. ' ON DUPLICATE KEY UPDATE `count` = `count` + VALUES(`count`), last_seen = VALUES(last_seen), last_path = VALUES(last_path), context = VALUES(context), message = VALUES(message)',
+					$args
+				)
+			);
+			if ( false !== $ok ) {
+				$ok = $wpdb->query(
+					$wpdb->prepare(
+						"INSERT INTO `{$days}` (fingerprint, day, `count`) VALUES " . implode( ', ', $day_rows ) . ' ON DUPLICATE KEY UPDATE `count` = `count` + VALUES(`count`)',
+						$day_args
+					)
+				);
+			}
+			// phpcs:enable
+			if ( false === $ok && self::error_table_missing() ) {
+				// Typically a database pulled from another environment without
+				// these tables. Forgetting the schema version rebuilds them on
+				// the next request instead of failing silently forever.
+				delete_option( 'jb_health_db_version' );
+			}
+		} catch ( Throwable $e ) {
+			unset( $e );
+		}
+		$wpdb->suppress_errors( $suppress );
+		self::$busy = false;
+	}
+
+	/**
+	 * Is it safe and sensible to write this buffer?
+	 *
+	 * Not while WordPress installs or upgrades, not while it sandboxes a
+	 * plugin activation (fatals there are the point of the exercise), and not
+	 * when the fatal is the database or object cache itself — writing through
+	 * a broken connection only adds a second failure to the first.
+	 *
+	 * @param array $buffer Buffered errors.
+	 * @return bool
+	 */
+	private static function can_write_errors( array $buffer ) {
+		global $wpdb;
+
+		if ( ! ( $wpdb instanceof wpdb ) || empty( $wpdb->ready ) ) {
+			return false;
+		}
+		if ( ( function_exists( 'wp_installing' ) && wp_installing() ) || ( defined( 'WP_SANDBOX_SCRAPING' ) && WP_SANDBOX_SCRAPING ) ) {
+			return false;
+		}
+		if ( function_exists( 'wp_is_maintenance_mode' ) && wp_is_maintenance_mode() ) {
+			return false;
+		}
+		if ( ! function_exists( 'get_option' ) || JB_HEALTH_VERSION !== get_option( 'jb_health_db_version' ) ) {
+			return false;
+		}
+		foreach ( $buffer as $row ) {
+			if ( 'fatal' !== $row['level'] ) {
+				continue;
+			}
+			if ( preg_match( '/mysqli|gone away|Error establishing a database connection|Too many connections/i', $row['message'] )
+				|| in_array( $row['component'], array( 'dropin:db.php', 'dropin:object-cache.php' ), true ) ) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	/** Did the last query fail because one of our tables is missing (MySQL 1146)? */
+	private static function error_table_missing() {
+		global $wpdb;
+		$dbh = $wpdb->dbh;
+		if ( $dbh instanceof mysqli && 1146 === mysqli_errno( $dbh ) ) {
+			return true;
+		}
+		return false !== stripos( (string) $wpdb->last_error, "doesn't exist" );
+	}
+
+	/**
+	 * Where a file sits, as the error log names it: the path relative to the
+	 * site (or `…/basename` outside it) and the component that owns it.
+	 *
+	 * @param string $file Absolute path from PHP.
+	 * @return array{file:string, component:string}
+	 */
+	private static function error_origin( $file ) {
+		if ( '' === (string) $file ) {
+			return array(
+				'file'      => '',
+				'component' => 'other',
+			);
+		}
+		$path  = self::norm_dir( $file );
+		$roots = self::error_roots();
+		$out   = array(
+			'file'      => self::relative_to( $path, $roots['labels'], '…/' ),
+			'component' => 'other',
+		);
+
+		foreach ( $roots['kinds'] as $dir => $kind ) {
+			$dir = (string) $dir;
+			if ( 0 !== strpos( $path, $dir . '/' ) ) {
+				continue;
+			}
+			$parts = explode( '/', substr( $path, strlen( $dir ) + 1 ) );
+			$top   = $parts[0];
+			$leaf  = 1 === count( $parts );
+
+			if ( 'plugin' === $kind ) {
+				$out['component'] = 'plugin:' . ( $leaf ? preg_replace( '/\.php$/', '', $top ) : $top );
+			} elseif ( 'mu-plugin' === $kind || 'theme' === $kind ) {
+				$out['component'] = $kind . ':' . $top;
+			} elseif ( 'core' === $kind ) {
+				$out['component'] = 'core';
+			} elseif ( 'dropin' === $kind && $leaf ) {
+				$out['component'] = 'dropin:' . $top;
+			} elseif ( 'vendor' === $kind && count( $parts ) > 2 ) {
+				$out['component'] = 'vendor:' . $top . '/' . $parts[1];
+			} elseif ( 'abspath' === $kind && $leaf && preg_match( '/^(?:wp-(?!config\.php$)[a-z0-9-]+\.php|index\.php|xmlrpc\.php)$/', $top ) ) {
+				$out['component'] = 'core';
+			}
+			// Longest root only: a file in app/uploads is not a drop-in just
+			// because app/ also holds object-cache.php.
+			break;
+		}
+		return $out;
+	}
+
+	/**
+	 * The directories the error log reasons about, normalised and longest
+	 * first, built once per request (again only if a theme root is registered
+	 * later — Bedrock adds wp/wp-content/themes from a mu-plugin).
+	 *
+	 * `labels` turns an absolute path into a relative one. The base is the
+	 * common parent of ABSPATH and WP_CONTENT_DIR — the web root on Bedrock
+	 * (wp/ + app/), the install root otherwise — rather than DOCUMENT_ROOT,
+	 * which CLI does not set: the same line must fingerprint the same way
+	 * from a page view and from WP-CLI.
+	 *
+	 * The Composer vendor directory is ignored when it sits inside a plugin,
+	 * theme or wp-content: then it is merely whichever plugin loaded Composer
+	 * first, and its files belong to that plugin.
+	 *
+	 * @return array{kinds: array<string,string>, labels: array<string,string>}
+	 */
+	private static function error_roots() {
+		$themes = isset( $GLOBALS['wp_theme_directories'] ) ? (array) $GLOBALS['wp_theme_directories'] : array();
+		if ( null !== self::$roots && count( $themes ) === self::$roots_key ) {
+			return self::$roots;
+		}
+		self::$roots_key = count( $themes );
+
+		$abspath = defined( 'ABSPATH' ) ? self::norm_dir( ABSPATH ) : '';
+		$content = defined( 'WP_CONTENT_DIR' ) ? self::norm_dir( WP_CONTENT_DIR ) : '';
+		$plugins = defined( 'WP_PLUGIN_DIR' ) ? self::norm_dir( WP_PLUGIN_DIR ) : '';
+		$mu      = defined( 'WPMU_PLUGIN_DIR' ) ? self::norm_dir( WPMU_PLUGIN_DIR ) : '';
+		$vendor  = self::composer_vendor_dir();
+
+		$theme_dirs = array();
+		foreach ( $themes as $dir ) {
+			$theme_dirs[] = self::norm_dir( $dir );
+		}
+		if ( '' !== $content ) {
+			$theme_dirs[] = $content . '/themes';
+		}
+
+		$owned = array_merge( array( $content, $plugins, $mu ), $theme_dirs );
+		foreach ( $owned as $dir ) {
+			if ( '' !== $dir && '' !== $vendor && 0 === strpos( $vendor . '/', $dir . '/' ) ) {
+				$vendor = '';
+			}
+		}
+
+		$pairs = array( array( $plugins, 'plugin' ), array( $mu, 'mu-plugin' ) );
+		foreach ( $theme_dirs as $dir ) {
+			$pairs[] = array( $dir, 'theme' );
+		}
+		if ( '' !== $abspath ) {
+			$pairs[] = array( $abspath . '/wp-includes', 'core' );
+			$pairs[] = array( $abspath . '/wp-admin', 'core' );
+			$pairs[] = array( $abspath, 'abspath' );
+		}
+		$pairs[] = array( $content, 'dropin' );
+		$pairs[] = array( $vendor, 'vendor' );
+
+		$kinds = array();
+		foreach ( $pairs as $pair ) {
+			if ( '' !== $pair[0] && ! isset( $kinds[ $pair[0] ] ) ) {
+				$kinds[ $pair[0] ] = $pair[1];
+			}
+		}
+
+		$base   = self::common_dir( $abspath, $content );
+		$labels = '' === $base ? array() : array( $base => '' );
+		$named  = array( array( $vendor, 'vendor' ), array( $plugins, 'plugins' ), array( $mu, 'mu-plugins' ), array( $content, 'wp-content' ) );
+		foreach ( $theme_dirs as $dir ) {
+			$named[] = array( $dir, 'themes' );
+		}
+		foreach ( $named as $pair ) {
+			if ( '' !== $pair[0] && ! isset( $labels[ $pair[0] ] ) && ( '' === $base || 0 !== strpos( $pair[0] . '/', $base . '/' ) ) ) {
+				$labels[ $pair[0] ] = $pair[1];
+			}
+		}
+
+		$longer_first = function ( $a, $b ) {
+			return strlen( (string) $b ) - strlen( (string) $a );
+		};
+		uksort( $kinds, $longer_first );
+		uksort( $labels, $longer_first );
+
+		self::$roots = array(
+			'kinds'  => $kinds,
+			'labels' => $labels,
+		);
+		return self::$roots;
+	}
+
+	/** Forward slashes, no trailing slash. */
+	private static function norm_dir( $path ) {
+		$path = function_exists( 'wp_normalize_path' ) ? wp_normalize_path( (string) $path ) : str_replace( '\\', '/', (string) $path );
+		return rtrim( $path, '/' );
+	}
+
+	/**
+	 * Deepest directory two paths share, or $a when all they share is "/".
+	 *
+	 * @param string $a Normalised directory.
+	 * @param string $b Normalised directory.
+	 * @return string
+	 */
+	private static function common_dir( $a, $b ) {
+		if ( '' === $a || '' === $b ) {
+			return '' !== $a ? $a : $b;
+		}
+		$pa     = explode( '/', $a );
+		$pb     = explode( '/', $b );
+		$common = array();
+		$n      = min( count( $pa ), count( $pb ) );
+		for ( $i = 0; $i < $n && $pa[ $i ] === $pb[ $i ]; $i++ ) {
+			$common[] = $pa[ $i ];
+		}
+		return count( $common ) > 1 ? implode( '/', $common ) : $a;
+	}
+
+	/** Composer's vendor directory, from wherever its ClassLoader was loaded; '' without Composer. */
+	private static function composer_vendor_dir() {
+		if ( ! class_exists( 'Composer\Autoload\ClassLoader', false ) ) {
+			return '';
+		}
+		try {
+			$reflection = new ReflectionClass( 'Composer\Autoload\ClassLoader' );
+			$file       = (string) $reflection->getFileName();
+		} catch ( Throwable $e ) {
+			return '';
+		}
+		return '' === $file ? '' : self::norm_dir( dirname( dirname( $file ) ) );
+	}
+
+	/**
+	 * Strip what an error message must not carry out of the site.
+	 *
+	 * PHP messages quote whatever the failing code was handling: absolute
+	 * paths, stack-frame arguments (a password passed to a login function
+	 * shows up verbatim), DSNs, emails, API keys. Everything here errs towards
+	 * removing too much — a mangled word costs nothing, a leaked credential in
+	 * a client-facing report costs a great deal.
+	 *
+	 * $is_path is for a request path: paths in it are URLs, not files, so the
+	 * filesystem and stack-trace rules are skipped.
+	 *
+	 * @param string $text    Message or request path.
+	 * @param bool   $is_path Whether $text is a request path.
+	 * @return string
+	 */
+	private static function redact_error_text( $text, $is_path = false ) {
+		$text = (string) $text;
+		if ( function_exists( 'wp_check_invalid_utf8' ) ) {
+			$text = wp_check_invalid_utf8( $text, true );
+		}
+
+		if ( ! $is_path ) {
+			$text = self::trim_stack_trace( $text );
+			foreach ( self::error_roots()['labels'] as $dir => $label ) {
+				$text = str_replace( $dir . '/', '' === $label ? '' : $label . '/', $text );
+			}
+			$text = preg_replace( '#((?:https?:)?/[^\s?\'"]*)\?[^\s\'"]*#', '$1', $text );
+			$text = preg_replace( '#(?<![\w.:/~-])/(?:[^\s/\'"()<>:,;]+/)+([^\s/\'"()<>:,;]+)#', '…/$1', $text );
+		}
+
+		$text = preg_replace(
+			array(
+				"/'[^'\\s]*'@'[^'\\s]*'/",
+				'/([\w-]*(?:passw(?:or)?d|pass|pwd|secret|token|api_?key|key|auth)[\w-]*)(["\']?)\s*[=:]\s*\S+/i',
+				'/eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{6,}|sk_(?:live|test)_[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{16}|gh[posru]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}/',
+			),
+			array( "'[user]'@'[host]'", '$1$2=[redacted]', '[token]' ),
+			$text
+		);
+
+		// Long hex/base64url runs are keys and hashes — but so, by shape, is a
+		// long plugin slug. Requiring a digit and a letter keeps the slugs.
+		$text = preg_replace_callback(
+			'/[A-Za-z0-9_-]{32,}/',
+			function ( $m ) {
+				return preg_match( '/[0-9]/', $m[0] ) && preg_match( '/[A-Za-z]/', $m[0] ) ? '[token]' : $m[0];
+			},
+			$text
+		);
+
+		$text = preg_replace_callback(
+			'/[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}/',
+			function ( $m ) {
+				return self::mask_email( $m[0] );
+			},
+			$text
+		);
+
+		$text = preg_replace( '/(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])/', '[ip]', $text );
+
+		// IPv6 only with a digit and either "::" or all eight groups, so a
+		// clock time (12:34:56) and a static call on a hex-looking class
+		// (Feed::add) survive.
+		return preg_replace_callback(
+			'/(?<![\w:])(?:[A-Fa-f0-9]{0,4}:){2,7}[A-Fa-f0-9]{0,4}(?![\w:])/',
+			function ( $m ) {
+				return preg_match( '/[0-9]/', $m[0] ) && ( false !== strpos( $m[0], '::' ) || 7 === substr_count( $m[0], ':' ) ) ? '[ip]' : $m[0];
+			},
+			$text
+		);
+	}
+
+	/**
+	 * Keep the first five frames of a stack trace, without their arguments.
+	 * Five is enough to see where a fatal came from; the arguments are where
+	 * secrets live.
+	 *
+	 * @param string $text Message.
+	 * @return string
+	 */
+	private static function trim_stack_trace( $text ) {
+		$at = strpos( $text, 'Stack trace:' );
+		if ( false === $at ) {
+			return $text;
+		}
+		$out     = array();
+		$frames  = 0;
+		$dropped = 0;
+		$gap_at  = 0;
+		foreach ( preg_split( '/\r\n|\r|\n/', substr( $text, $at ) ) as $line ) {
+			if ( ! preg_match( '/^#\d+ /', $line ) ) {
+				$out[] = $line;
+				continue;
+			}
+			if ( ++$frames > 5 ) {
+				if ( 0 === $dropped++ ) {
+					$gap_at = count( $out );
+				}
+				continue;
+			}
+			$out[] = preg_replace( '/^(#\d+ .*?: [^\s(]+)\(.*\)\s*$/', '$1()', $line );
+		}
+		if ( $dropped ) {
+			array_splice( $out, $gap_at, 0, '#… ' . $dropped . ' more frames' );
+		}
+		return substr( $text, 0, $at ) . implode( "\n", $out );
+	}
+
+	/**
+	 * The message as the fingerprint sees it: first line, no stack trace,
+	 * numbers and quoted values blanked — so "Undefined array key "a"" and
+	 * "…"b"" from the same line are one group.
+	 *
+	 * @param string $message Redacted message.
+	 * @return string
+	 */
+	private static function normalise_error_message( $message ) {
+		$lines = preg_split( '/\r\n|\r|\n/', (string) $message, 2 );
+		$line  = $lines[0];
+		$cut   = strpos( $line, 'Stack trace:' );
+		if ( false !== $cut ) {
+			$line = substr( $line, 0, $cut );
+		}
+		return trim( preg_replace( array( '/\'[^\']*\'|"[^"]*"/', '/[0-9]+/' ), array( "'?'", 'N' ), $line ) );
+	}
+
+	/** fatal | warning | notice | deprecated. */
+	private static function error_level( $no ) {
+		if ( $no & self::FATAL_TYPES ) {
+			return 'fatal';
+		}
+		if ( $no & ( E_NOTICE | E_USER_NOTICE ) ) {
+			return 'notice';
+		}
+		if ( $no & ( E_DEPRECATED | E_USER_DEPRECATED ) ) {
+			return 'deprecated';
+		}
+		return 'warning';
+	}
+
+	/** The PHP constant name for an error level. */
+	private static function error_type_name( $no ) {
+		$names = array(
+			E_ERROR             => 'E_ERROR',
+			E_WARNING           => 'E_WARNING',
+			E_PARSE             => 'E_PARSE',
+			E_NOTICE            => 'E_NOTICE',
+			E_CORE_ERROR        => 'E_CORE_ERROR',
+			E_CORE_WARNING      => 'E_CORE_WARNING',
+			E_COMPILE_ERROR     => 'E_COMPILE_ERROR',
+			E_COMPILE_WARNING   => 'E_COMPILE_WARNING',
+			E_USER_ERROR        => 'E_USER_ERROR',
+			E_USER_WARNING      => 'E_USER_WARNING',
+			E_USER_NOTICE       => 'E_USER_NOTICE',
+			E_RECOVERABLE_ERROR => 'E_RECOVERABLE_ERROR',
+			E_DEPRECATED        => 'E_DEPRECATED',
+			E_USER_DEPRECATED   => 'E_USER_DEPRECATED',
+		);
+		return isset( $names[ $no ] ) ? $names[ $no ] : 'E_UNKNOWN';
+	}
+
+	/**
+	 * What kind of request raised the errors. Every check is guarded: this can
+	 * run before WordPress has finished loading.
+	 *
+	 * @return string cli | cron | ajax | rest | admin | web
+	 */
+	private static function error_context() {
+		if ( 'cli' === PHP_SAPI || ( defined( 'WP_CLI' ) && WP_CLI ) ) {
+			return 'cli';
+		}
+		if ( function_exists( 'wp_doing_cron' ) && wp_doing_cron() ) {
+			return 'cron';
+		}
+		if ( function_exists( 'wp_doing_ajax' ) && wp_doing_ajax() ) {
+			return 'ajax';
+		}
+		$uri = isset( $_SERVER['REQUEST_URI'] ) ? (string) $_SERVER['REQUEST_URI'] : ''; // phpcs:ignore WordPress.Security.ValidatedSanitizedInput -- only searched, never stored.
+		if ( ( defined( 'REST_REQUEST' ) && REST_REQUEST ) || false !== strpos( $uri, '/wp-json/' ) || false !== strpos( $uri, 'rest_route=' ) ) {
+			return 'rest';
+		}
+		if ( function_exists( 'is_admin' ) && is_admin() ) {
+			return 'admin';
+		}
+		return 'web';
+	}
+
+	/** The request path, without its query string, redacted; '' in CLI. */
+	private static function error_request_path() {
+		if ( 'cli' === PHP_SAPI || empty( $_SERVER['REQUEST_URI'] ) ) {
+			return '';
+		}
+		$path = preg_replace( '/[?#].*$/s', '', (string) wp_unslash( $_SERVER['REQUEST_URI'] ) ); // phpcs:ignore WordPress.Security.ValidatedSanitizedInput -- redacted below.
+		return self::clip( self::redact_error_text( $path, true ), 255 );
+	}
+
+	/** Name of the error groups table. */
+	private static function error_table() {
+		global $wpdb;
+		return $wpdb->prefix . 'jb_health_errors';
+	}
+
+	/** Name of the per-day counts table. */
+	private static function error_days_table() {
+		global $wpdb;
+		return $wpdb->prefix . 'jb_health_error_days';
+	}
+
+	/**
+	 * Create or update the error tables when the plugin version moves past the
+	 * one recorded in `jb_health_db_version` (plugins_loaded, so an in-place
+	 * deploy with no activation hook still gets them).
+	 *
+	 * The option is autoloaded because this runs on every request. A failed
+	 * create (a database user without CREATE, say) is recorded and retried
+	 * hourly rather than attempted on every page.
+	 */
+	public static function maybe_upgrade() {
+		global $wpdb;
+
+		if ( function_exists( 'wp_installing' ) && wp_installing() ) {
+			return;
+		}
+		$version = get_option( 'jb_health_db_version' );
+		if ( JB_HEALTH_VERSION === $version ) {
+			return;
+		}
+		if ( is_string( $version ) && 0 === strpos( $version, 'failed:' ) && time() - (int) substr( $version, 7 ) < HOUR_IN_SECONDS ) {
+			return;
+		}
+
+		$suppress = $wpdb->suppress_errors( true );
+		self::create_error_tables();
+		$ok = self::table_exists( self::error_table() ) && self::table_exists( self::error_days_table() );
+		$wpdb->suppress_errors( $suppress );
+
+		update_option( 'jb_health_db_version', $ok ? JB_HEALTH_VERSION : 'failed:' . time(), true );
+	}
+
+	/** dbDelta both error tables. Idempotent. */
+	private static function create_error_tables() {
+		global $wpdb;
+		require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+		$charset = $wpdb->get_charset_collate();
+		$errors  = self::error_table();
+		$days    = self::error_days_table();
+
+		dbDelta(
+			"CREATE TABLE {$errors} (
+				fingerprint char(40) NOT NULL,
+				level varchar(16) NOT NULL DEFAULT '',
+				type smallint(5) unsigned NOT NULL DEFAULT 0,
+				message text NULL,
+				file varchar(255) NOT NULL DEFAULT '',
+				line int(10) unsigned NOT NULL DEFAULT 0,
+				component varchar(191) NOT NULL DEFAULT '',
+				context varchar(16) NOT NULL DEFAULT '',
+				last_path varchar(255) NOT NULL DEFAULT '',
+				first_seen datetime NOT NULL,
+				last_seen datetime NOT NULL,
+				count bigint(20) unsigned NOT NULL DEFAULT 0,
+				PRIMARY KEY  (fingerprint),
+				KEY last_seen (last_seen),
+				KEY level_last_seen (level,last_seen)
+			) {$charset};"
+		);
+		dbDelta(
+			"CREATE TABLE {$days} (
+				fingerprint char(40) NOT NULL,
+				day date NOT NULL,
+				count bigint(20) unsigned NOT NULL DEFAULT 0,
+				PRIMARY KEY  (fingerprint,day)
+			) {$charset};"
+		);
+	}
+
+	/**
+	 * Is capture on and are the tables there to read? `levels` lists what is
+	 * recorded; empty when nothing is.
+	 *
+	 * A table missing behind a current schema version (a database pulled from
+	 * another environment) forgets the version, so the next request rebuilds.
+	 *
+	 * @return array{enabled:bool, levels:string[], reason:?string}
+	 */
+	private static function error_capture_state() {
+		$state = array(
+			'enabled' => false,
+			'levels'  => array(),
+			'reason'  => null,
+		);
+		if ( ! self::capture_enabled() ) {
+			$state['reason'] = 'error capture is switched off on this site (JB_HEALTH_CAPTURE_ERRORS is false)';
+			return $state;
+		}
+
+		$version = get_option( 'jb_health_db_version' );
+		if ( JB_HEALTH_VERSION !== $version ) {
+			$state['reason'] = is_string( $version ) && 0 === strpos( $version, 'failed:' )
+				? 'the error tables could not be created; the database user may lack the CREATE privilege'
+				: 'the error tables are not installed yet; they are created on the next request';
+			return $state;
+		}
+		if ( ! self::table_exists( self::error_table() ) || ! self::table_exists( self::error_days_table() ) ) {
+			delete_option( 'jb_health_db_version' );
+			$state['reason'] = 'the error tables are missing (often a database copied from another environment); they are rebuilt on the next request';
+			return $state;
+		}
+
+		$state['enabled'] = true;
+		$state['levels']  = self::captured_levels();
+		return $state;
+	}
+
+	/** Levels recorded: fatal always, then whatever JB_HEALTH_ERROR_LEVELS asks for. */
+	private static function captured_levels() {
+		$mask   = (int) JB_HEALTH_ERROR_LEVELS & self::CAPTURABLE_TYPES;
+		$levels = array( 'fatal' );
+		if ( $mask & ( E_WARNING | E_USER_WARNING ) ) {
+			$levels[] = 'warning';
+		}
+		if ( $mask & ( E_NOTICE | E_USER_NOTICE ) ) {
+			$levels[] = 'notice';
+		}
+		if ( $mask & ( E_DEPRECATED | E_USER_DEPRECATED ) ) {
+			$levels[] = 'deprecated';
+		}
+		return $levels;
+	}
+
+	/**
+	 * Retention, applied whenever the log is read (no cron to depend on): day
+	 * rows older than 35 days, groups unseen for 30, then all but the 500 most
+	 * recently seen groups, then any day rows left without a group.
+	 */
+	private static function prune_errors() {
+		global $wpdb;
+		$errors = self::error_table();
+		$days   = self::error_days_table();
+
+		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.DirectDatabaseQuery -- table names cannot be bound.
+		$wpdb->query( $wpdb->prepare( "DELETE FROM `{$days}` WHERE day < %s", gmdate( 'Y-m-d', time() - ( 35 * DAY_IN_SECONDS ) ) ) );
+		$wpdb->query( $wpdb->prepare( "DELETE FROM `{$errors}` WHERE last_seen < %s", gmdate( 'Y-m-d H:i:s', time() - ( 30 * DAY_IN_SECONDS ) ) ) );
+		$cutoff = $wpdb->get_var( "SELECT last_seen FROM `{$errors}` ORDER BY last_seen DESC LIMIT 499, 1" );
+		if ( $cutoff ) {
+			$wpdb->query( $wpdb->prepare( "DELETE FROM `{$errors}` WHERE last_seen < %s", $cutoff ) );
+		}
+		$wpdb->query( "DELETE d FROM `{$days}` d LEFT JOIN `{$errors}` e ON e.fingerprint = d.fingerprint WHERE e.fingerprint IS NULL" );
+		// phpcs:enable
+	}
+
+	/**
+	 * Thirty rows, oldest first, ending today (UTC), zero-filled: site-wide
+	 * counts per level. `notice` / `deprecated` only when they are recorded.
+	 *
+	 * @param bool $query False for the zero rows alone (capture off).
+	 * @param int  $now   Unix time "today" is taken from.
+	 * @return array
+	 */
+	private static function error_daily( $query, $now ) {
+		global $wpdb;
+
+		$levels = array( 'fatal', 'warning' );
+		foreach ( array( 'notice', 'deprecated' ) as $optional ) {
+			if ( in_array( $optional, self::captured_levels(), true ) ) {
+				$levels[] = $optional;
+			}
+		}
+
+		$rows = array();
+		for ( $i = 29; $i >= 0; $i-- ) {
+			$day          = gmdate( 'Y-m-d', $now - ( $i * DAY_IN_SECONDS ) );
+			$rows[ $day ] = array_merge( array( 'day' => $day ), array_fill_keys( $levels, 0 ) );
+		}
+		if ( ! $query ) {
+			return array_values( $rows );
+		}
+
+		$errors = self::error_table();
+		$days   = self::error_days_table();
+		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- table names cannot be bound.
+		$found = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT d.day, e.level, SUM(d.`count`) AS c
+				 FROM `{$days}` d
+				 JOIN `{$errors}` e ON e.fingerprint = d.fingerprint
+				 WHERE d.day >= %s
+				 GROUP BY d.day, e.level",
+				gmdate( 'Y-m-d', $now - ( 29 * DAY_IN_SECONDS ) )
+			),
+			ARRAY_A
+		);
+		// phpcs:enable
+
+		foreach ( (array) $found as $r ) {
+			if ( isset( $rows[ $r['day'] ][ $r['level'] ] ) ) {
+				$rows[ $r['day'] ][ $r['level'] ] += (int) $r['c'];
+			}
+		}
+		return array_values( $rows );
+	}
+
+	/**
+	 * One stored group in the contract's shape (minus `days`).
+	 *
+	 * @param array $row Row from the groups table.
+	 * @return array
+	 */
+	private static function error_group( array $row ) {
+		$file = (string) $row['file'];
+		return array(
+			'fingerprint' => (string) $row['fingerprint'],
+			'level'       => (string) $row['level'],
+			'type'        => self::error_type_name( (int) $row['type'] ),
+			'message'     => (string) $row['message'],
+			'file'        => '' === $file ? null : $file,
+			'line'        => '' === $file ? null : (int) $row['line'],
+			'component'   => (string) $row['component'],
+			'context'     => (string) $row['context'],
+			'last_path'   => '' === (string) $row['last_path'] ? null : (string) $row['last_path'],
+			'first_seen'  => self::utc_from_mysql( $row['first_seen'] ),
+			'last_seen'   => self::utc_from_mysql( $row['last_seen'] ),
+			'count'       => (int) $row['count'],
+		);
+	}
+
+	/**
+	 * Day counts for a set of groups, from $from_day on, oldest first.
+	 *
+	 * @param string[] $fingerprints Groups.
+	 * @param string   $from_day     UTC date, Y-m-d.
+	 * @return array fingerprint => [[day, count], …]
+	 */
+	private static function error_group_days( array $fingerprints, $from_day ) {
+		global $wpdb;
+		if ( empty( $fingerprints ) ) {
+			return array();
+		}
+		$days = self::error_days_table();
+		$in   = implode( ', ', array_fill( 0, count( $fingerprints ), '%s' ) );
+		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders -- table name cannot be bound; IN list is placeholders.
+		$rows = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT fingerprint, day, `count` FROM `{$days}` WHERE fingerprint IN ({$in}) AND day >= %s ORDER BY day",
+				array_merge( $fingerprints, array( $from_day ) )
+			),
+			ARRAY_A
+		);
+		// phpcs:enable
+		$out = array();
+		foreach ( (array) $rows as $r ) {
+			$out[ $r['fingerprint'] ][] = array( $r['day'], (int) $r['count'] );
+		}
+		return $out;
+	}
+
+	/**
+	 * The `errors` block of /report: a month at a glance, and the five groups
+	 * that matter most — fatals first, then by how often they fired in the
+	 * last 30 days. Nulls and a reason when capture is off.
+	 *
+	 * @return array
+	 */
+	private static function errors_summary() {
+		global $wpdb;
+
+		$state = self::error_capture_state();
+		$out   = array(
+			'capture_enabled'   => $state['enabled'],
+			'reason'            => $state['reason'],
+			'fatal_30d'         => null,
+			'warning_30d'       => null,
+			'groups_active_24h' => null,
+			'last_fatal_at'     => null,
+			'top'               => array(),
+		);
+		if ( ! $state['enabled'] ) {
+			return $out;
+		}
+
+		self::prune_errors();
+		$now    = time();
+		$daily  = self::error_daily( true, $now );
+		$errors = self::error_table();
+		$days   = self::error_days_table();
+
+		$out['fatal_30d']   = array_sum( array_column( $daily, 'fatal' ) );
+		$out['warning_30d'] = array_sum( array_column( $daily, 'warning' ) );
+
+		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- table names cannot be bound.
+		$out['groups_active_24h'] = (int) $wpdb->get_var(
+			$wpdb->prepare( "SELECT COUNT(*) FROM `{$errors}` WHERE last_seen >= %s", gmdate( 'Y-m-d H:i:s', $now - DAY_IN_SECONDS ) )
+		);
+		$last_fatal = $wpdb->get_var( "SELECT MAX(last_seen) FROM `{$errors}` WHERE level = 'fatal'" );
+		$top        = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT e.*, t.c30
+				 FROM `{$errors}` e
+				 JOIN ( SELECT fingerprint, SUM(`count`) AS c30 FROM `{$days}` WHERE day >= %s GROUP BY fingerprint ) t
+				   ON t.fingerprint = e.fingerprint
+				 ORDER BY ( e.level = 'fatal' ) DESC, t.c30 DESC, e.last_seen DESC
+				 LIMIT 5",
+				gmdate( 'Y-m-d', $now - ( 29 * DAY_IN_SECONDS ) )
+			),
+			ARRAY_A
+		);
+		// phpcs:enable
+
+		$out['last_fatal_at'] = $last_fatal ? self::utc_from_mysql( $last_fatal ) : null;
+		foreach ( (array) $top as $row ) {
+			$out['top'][] = self::error_group( $row );
+		}
+		return $out;
+	}
+
+	/**
+	 * GET /wp-json/jb-health/v1/errors — the recorded groups seen since
+	 * `since` (default the last 24 hours), newest first, plus 30 days of
+	 * site-wide daily counts.
+	 *
+	 * @param WP_REST_Request $request Request.
+	 * @return WP_REST_Response
+	 */
+	public static function handle_errors( $request ) {
+		global $wpdb;
+
+		$now   = time();
+		$since = null === $request->get_param( 'since' ) ? false : self::parse_since( $request->get_param( 'since' ) );
+		$since = false === $since ? $now - DAY_IN_SECONDS : $since;
+		$limit = (int) $request->get_param( 'limit' );
+		$level = (string) $request->get_param( 'level' );
+		$state = self::error_capture_state();
+
+		$groups    = array();
+		$truncated = false;
+
+		if ( $state['enabled'] ) {
+			self::prune_errors();
+
+			$table = self::error_table();
+			$where = 'last_seen >= %s';
+			$args  = array( gmdate( 'Y-m-d H:i:s', $since ) );
+			if ( '' !== $level ) {
+				$where .= ' AND level = %s';
+				$args[] = $level;
+			}
+			$args[] = $limit + 1;
+
+			// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- table name cannot be bound; $where is built from placeholders.
+			$rows = $wpdb->get_results(
+				$wpdb->prepare( "SELECT * FROM `{$table}` WHERE {$where} ORDER BY last_seen DESC, fingerprint LIMIT %d", $args ),
+				ARRAY_A
+			);
+			// phpcs:enable
+			$rows = is_array( $rows ) ? $rows : array();
+			if ( count( $rows ) > $limit ) {
+				$truncated = true;
+				$rows      = array_slice( $rows, 0, $limit );
+			}
+
+			$days = self::error_group_days( array_column( $rows, 'fingerprint' ), gmdate( 'Y-m-d', $since ) );
+			foreach ( $rows as $row ) {
+				$group         = self::error_group( $row );
+				$group['days'] = isset( $days[ $row['fingerprint'] ] ) ? $days[ $row['fingerprint'] ] : array();
+				$groups[]      = $group;
+			}
+		}
+
+		$response = new WP_REST_Response(
+			array(
+				'ok'             => true,
+				'schema_version' => JB_HEALTH_SCHEMA,
+				'plugin_version' => JB_HEALTH_VERSION,
+				'generated_at'   => self::utc( $now ),
+				'site'           => array(
+					'home'    => get_home_url(),
+					'siteurl' => get_site_url(),
+				),
+				'capture'        => $state,
+				'window'         => array(
+					'since' => self::utc( $since ),
+					'until' => self::utc( $now ),
+				),
+				'truncated'      => $truncated,
+				'groups'         => $groups,
+				'daily'          => self::error_daily( $state['enabled'], $now ),
+			),
+			200
+		);
+		$response->header( 'Cache-Control', 'no-store, private' );
+		return $response;
+	}
+
+	/**
+	 * `since`: ISO 8601 or unix seconds.
+	 *
+	 * @param mixed $value Raw query value.
+	 * @return true|WP_Error
+	 */
+	public static function validate_since( $value ) {
+		if ( false !== self::parse_since( $value ) ) {
+			return true;
+		}
+		return new WP_Error( 'jb_health_bad_since', 'since must be an ISO 8601 date-time or unix seconds.', array( 'status' => 400 ) );
+	}
+
+	/**
+	 * `limit`: 1–500.
+	 *
+	 * @param mixed $value Raw query value.
+	 * @return true|WP_Error
+	 */
+	public static function validate_limit( $value ) {
+		if ( is_scalar( $value ) && preg_match( '/^[0-9]+$/D', (string) $value ) && (int) $value >= 1 && (int) $value <= 500 ) {
+			return true;
+		}
+		return new WP_Error( 'jb_health_bad_limit', 'limit must be an integer between 1 and 500.', array( 'status' => 400 ) );
+	}
+
+	/**
+	 * `level`: one of the four the log records.
+	 *
+	 * @param mixed $value Raw query value.
+	 * @return true|WP_Error
+	 */
+	public static function validate_level( $value ) {
+		if ( is_string( $value ) && in_array( $value, array( 'fatal', 'warning', 'notice', 'deprecated' ), true ) ) {
+			return true;
+		}
+		return new WP_Error( 'jb_health_bad_level', 'level must be one of fatal, warning, notice, deprecated.', array( 'status' => 400 ) );
+	}
+
+	/**
+	 * Unix seconds from `since`, or false. strtotime() alone would also take
+	 * "yesterday" or "next monday", so the shape is checked first; a time with
+	 * no offset is read as UTC.
+	 *
+	 * @param mixed $value Raw query value.
+	 * @return int|false
+	 */
+	private static function parse_since( $value ) {
+		if ( ! is_scalar( $value ) ) {
+			return false;
+		}
+		$value = trim( (string) $value );
+		if ( preg_match( '/^[0-9]{1,10}$/D', $value ) ) {
+			return (int) $value;
+		}
+		if ( ! preg_match( '/^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?)?(Z|[+-]\d{2}:?\d{2})?$/iD', $value, $m ) ) {
+			return false;
+		}
+		$ts = strtotime( empty( $m[1] ) ? $value . ' UTC' : $value );
+		return false === $ts ? false : $ts;
+	}
+
+	/** Unix time as ISO 8601 UTC with a Z, the contract's timestamp format. */
+	private static function utc( $ts ) {
+		return gmdate( 'Y-m-d\TH:i:s\Z', (int) $ts );
+	}
+
+	/** A stored UTC DATETIME as ISO 8601 with a Z; null if unreadable. */
+	private static function utc_from_mysql( $datetime ) {
+		$ts = strtotime( (string) $datetime . ' UTC' );
+		return false === $ts ? null : self::utc( $ts );
 	}
 
 	// ----------------------------------------------------------------- //
